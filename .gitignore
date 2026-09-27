@@ -22,8 +22,11 @@ dist-ssr
 *.sln
 *.sw?
 uploads/*
-README.md
-DEPLOY.MD
+!uploads/.gitkeep
+backups/
 manifesto.db
 manifesto.db-shm
 manifesto.db-wal
+
+# Docker
+.env

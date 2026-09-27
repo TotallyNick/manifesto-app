@@ -9,7 +9,7 @@ import ErrorBoundary from './components/ErrorBoundary';
 import { Clock, Dashboard, Compose, Archive, Personnel, SettingsCog } from './views';
 import './index.css';
 
-// The public face of the site, before anyone has signed in — a mundane cover, same as every
+// The public face of the site, before anyone has signed in, a mundane cover, same as every
 // account's own cover name, and never the real name. Keep this in sync with the <title> in
 // index.html, which can't import this file, so a change here needs a matching change there.
 export const PUBLIC_BRAND = 'The Ledger';
@@ -53,7 +53,7 @@ export default function App() {
   useEffect(() => { api.get('/me').then(setMe).catch(() => setMe(null)); }, []);
   useEffect(() => { if (me) api.get('/settings').then(setSettings).catch(() => {}); }, [me]);
   useEffect(() => { document.documentElement.dataset.theme = settings.theme; document.documentElement.dataset.font = settings.font; }, [settings]);
-  // The tab title starts as the public cover, PUBLIC_BRAND (set in index.html) — once signed in it
+  // The tab title starts as the public cover, PUBLIC_BRAND (set in index.html) once signed in it
   // switches to this account's own brand: a cover name below the reveal clearance, "Manifesto" at
   // or above it. Signing out puts the public cover back.
   useEffect(() => { document.title = me ? me.brand : PUBLIC_BRAND; }, [me]);

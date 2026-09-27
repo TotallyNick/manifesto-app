@@ -1,0 +1,13 @@
+node_modules
+dist
+uploads
+backups
+manifesto.db
+manifesto.db-shm
+manifesto.db-wal
+.git
+.gitignore
+.gitattributes
+*.log
+.env
+.env.*

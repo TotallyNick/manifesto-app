@@ -448,7 +448,7 @@ export function Report({ r, me, onChange, reveal, variant = 'list', shredder }) 
                     <HoldButton size="sm" radius={99} holdTime={600} doneLabel="Off" backgroundColor="transparent" textColor="var(--dim)"
                       fillColor="#a33a34" glow={false} resetAfter={400} className="tag-del" onHold={() => editToggle(t.id)}>×</HoldButton></span>))}
                 <button type="button" className="plus" onClick={() => { if (!allTags.length) loadTags(); setEditPicker(true); }} aria-label="Add tags">+ Tags</button></div>
-              <p className="dim">A name still mentioned in the text is re-tagged automatically — remove it here only if it shouldn't apply going forward.</p>
+              <p className="dim">A name still mentioned in the text is re-tagged automatically. Remove it here only if it shouldn't apply going forward.</p>
               <input placeholder="Why are you changing it? (kept in the history)" value={f.note} onChange={set('note')} />
               <p className="dim">The original and every earlier version stay in the history.</p>
               <button className="primary" onClick={() => send('edit', { ...f, addTagIds: f.addIds, removeTagIds: f.removeIds })}>Save revision</button></div>)}
@@ -457,7 +457,7 @@ export function Report({ r, me, onChange, reveal, variant = 'list', shredder }) 
           {mode === 'addend' && (
             <div className="form"><textarea rows={5} placeholder="Additional information, from this or a later source..." value={f.body} onChange={set('body')} />
               <div className="row"><ConfSelect value={f.confidence} onChange={set('confidence')} /><SourceField value={f.source} onChange={set('source')} /></div>
-              <p className="dim">An addendum can't be edited or removed once posted — it's a dated statement on the record.</p>
+              <p className="dim">An addendum can't be edited or removed once posted. It's a dated statement on the record.</p>
               <button className="primary" onClick={() => send('addenda', f)}>Post addendum</button></div>)}
           {mode === 'hist' && (
             <div className="form">{r.revisions.map((v) => (
@@ -595,10 +595,10 @@ export function Compose({ done, me }) {
           </fieldset>
           {err && <p className="bad">{err}</p>}
           <p className="dim">{me.role === 'warden'
-            ? (clearance > 0 ? `Below Clearance: ${CLEARANCE_LABEL[clearance]}, this report reads as scrambled nonsense — a Warden can still grant it to specific people.` : 'Everyone can read this one.')
-            : 'Filed at Warden-only clearance — only you and a Warden can read it, unless a Warden opens it up further.'}</p>
-          <p className="dim">After you press it, the fuse burns for six seconds. Press Undo before it ends and nothing is sent.</p>
-          <FuseButton label="Lodge report" doneLabel="Lodged" undoLabel="Undo" undoWindow={6000} size="lg" radius={10} fuse="outline"
+            ? (clearance > 0 ? `Below Clearance: ${CLEARANCE_LABEL[clearance]}, this report reads as scrambled nonsense, it is encripted. A Warden can still grant it to specific people.` : 'Everyone can read this one.')
+            : 'Filed at Warden-only clearance. Only you and a Warden can read it, unless a Warden opens it up further.'}</p>
+          <p className="dim">After you press it, the fuse burns for one second. Press Undo before it ends and nothing is sent.</p>
+          <FuseButton label="Lodge report" doneLabel="Lodged" undoLabel="Undo" undoWindow={1000} size="lg" radius={10} fuse="outline"
             background="#27272a" color="#f5f5f5" fuseColor="#e0b94a" disabled={!title.trim() || !body.trim()} onCommit={arm} onUndo={undo} onFuseEnd={fire} />
         </div>
       </BorderGlow>
@@ -654,7 +654,7 @@ function ReportsArchive({ me, sel, setSel, view }) {
       {isWarden && (
         <aside className="shred-rail">
           <h3>Redaction shredder</h3>
-          <p className="dim">Drag a report — a list row or a dossier tile — into the slot to redact it. It stays in the vault; a Warden can restore it, or purge it for good once it's redacted.</p>
+          <p className="dim">Drag a report, a list row or a dossier tile into the slot to redact it. It stays in the vault; a Warden can restore it, or purge it for good once it's redacted.</p>
           <ErrorBoundary label="The shredder">
             <div className="shredder-mount">
               <Shredder ref={shredRef} items={[]} renderItem={() => null} width={280} height={220}
@@ -688,7 +688,7 @@ function FactionsArchive({ me }) {
     <div>
       <div className="panel">
         <h2>Faction rosters</h2>
-        <p className="dim">Who's in a faction and their rank — a living list, edited in place by whoever's tracking it, not a case file. A Warden can raise a faction's clearance to seal its roster the same way a report is sealed.</p>
+        <p className="dim">Who's in a faction and their rank, edited in place by whoever's tracking it, not a case file. A Warden can raise a faction's clearance to seal its roster the same way a report is sealed.</p>
         <div className="row"><input placeholder="New faction name" value={newName} onChange={(e) => setNewName(e.target.value)} /><button onClick={createFaction}>Create faction</button></div>
         {err && <p className="bad">{err}</p>}
       </div>
@@ -749,7 +749,7 @@ function NoteBubble({ n, mine, otherLabel, manage }) {
       <div className="note-from dim">
         {label} · {stamp(n.created_at)}
         {manage && !!n.edited_at && !deleted && <span className="note-flag">edited</span>}
-        {deleted && <span className="note-flag note-flag-del">deleted — hidden from them</span>}
+        {deleted && <span className="note-flag note-flag-del">deleted, hidden from them</span>}
         {manage && !editing && (
           <span className="note-manage">
             {deleted ? (
@@ -806,7 +806,7 @@ function WardenNotes() {
     <div className="notes-wrap">
       <div className="notes-list panel">
         <h3>Chats</h3>
-        <p className="dim">Open a chat with any agent. They'll only ever see it came from "The Wardens" — never which one.</p>
+        <p className="dim">Open a chat with any agent. They'll only ever see it came from "The Wardens".</p>
         {threads.map((t) => (
           <button key={t.user_id} className={'notes-thread' + (sel?.user_id === t.user_id ? ' on' : '') + (t.hidden ? ' hidden-thread' : '')} onClick={() => openThread(t)}>
             <span>{t.callsign}{t.hidden ? ' (hidden)' : ''}</span>{t.unread > 0 && <b className="notes-badge">{t.unread}</b>}
@@ -821,7 +821,7 @@ function WardenNotes() {
               <span className="spacer" />
               <button onClick={toggleHidden}>{thread.hidden ? 'Unhide from them' : 'Hide from them'}</button>
             </div>
-            {thread.hidden && <p className="dim">This chat is pulled from their Archive — they can't see it, or that it exists.</p>}
+            {thread.hidden && <p className="dim">This chat is pulled from their Archive. They can't see it, or that it exists.</p>}
             <div className="notes-scroll">
               {thread.messages.map((n) => (
                 <NoteBubble key={n.id} n={n} mine={n.sender === 'warden'} otherLabel={sel.callsign}
@@ -856,7 +856,7 @@ function MemberNotes({ onRead }) {
   return (
     <div className="notes-thread-pane panel">
       <h3>Notes from the Wardens</h3>
-      <p className="dim">Only you and the Wardens can see this — and you'll never know which Warden sent a note.</p>
+      <p className="dim">Only you and the Wardens can see this.</p>
       <div className="notes-scroll">
         {msgs.map((n) => <NoteBubble key={n.id} n={n} mine={n.sender === 'member'} />)}
         {!msgs.length && <p className="dim">Nothing yet.</p>}
@@ -1096,7 +1096,7 @@ function PoisArchive({ me, openTag, view }) {
             {me.role === 'warden' && <ClearanceSelect value={form.clearance} onChange={(c) => setForm({ ...form, clearance: c })} />}
             <p className="dim">{me.role === 'warden'
               ? 'A file always opens at Warden-only clearance unless lowered here.'
-              : 'This file opens at Warden-only clearance — a Warden can open it up afterward.'}</p>
+              : 'This file opens at Warden-only clearance, a Warden can open it up afterward.'}</p>
             {err && <p className="bad">{err}</p>}
             <div className="row"><button className="primary" onClick={create}>Open file</button><button onClick={() => setForm(null)}>Cancel</button></div></div>)}
       </div>
