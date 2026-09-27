@@ -1,4 +1,9 @@
-{$DOMAIN} {
+{$DOMAIN}:{$PUBLIC_PORT} {
 	encode gzip zstd
+
+	tls {
+		dns cloudflare {$CLOUDFLARE_API_TOKEN}
+	}
+
 	reverse_proxy app:3000
 }

@@ -11,15 +11,21 @@ services:
       - "3000"
 
   caddy:
-    image: caddy:2-alpine
+    build:
+      context: .
+      dockerfile: Dockerfile.caddy
     restart: unless-stopped
     depends_on:
       - app
     environment:
       DOMAIN: ${DOMAIN}
+      PUBLIC_PORT: ${PUBLIC_PORT:-8443}
+      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN}
+    dns:
+      - 1.1.1.1
+      - 1.0.0.1
     ports:
-      - "80:80"
-      - "443:443"
+      - "${PUBLIC_PORT:-8443}:${PUBLIC_PORT:-8443}"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
