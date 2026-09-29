@@ -70,6 +70,16 @@ CREATE TABLE IF NOT EXISTS report_revisions(
 CREATE TABLE IF NOT EXISTS addenda(
   id INTEGER PRIMARY KEY, report_id INTEGER NOT NULL REFERENCES reports(id), body TEXT NOT NULL, confidence TEXT,
   source_id INTEGER REFERENCES sources(id), author_id INTEGER NOT NULL REFERENCES users(id), created_at TEXT NOT NULL DEFAULT (${NOW}));
+-- An addendum can be amended the same way a report can — the original addenda row above never
+-- changes (add_no_upd/add_no_del below still guard it), every edit is a new row here instead, and
+-- the latest one is what's shown. Same append-only, nothing-really-gone guarantee as a report edit.
+CREATE TABLE IF NOT EXISTS addendum_revisions(
+  id INTEGER PRIMARY KEY, addendum_id INTEGER NOT NULL REFERENCES addenda(id),
+  body TEXT NOT NULL, confidence TEXT, source_id INTEGER REFERENCES sources(id), note TEXT,
+  edited_by INTEGER NOT NULL REFERENCES users(id), edited_at TEXT NOT NULL DEFAULT (${NOW}));
+CREATE TRIGGER IF NOT EXISTS addrev_no_upd BEFORE UPDATE ON addendum_revisions BEGIN SELECT RAISE(ABORT, 'history is permanent'); END;
+CREATE TRIGGER IF NOT EXISTS addrev_no_del BEFORE DELETE ON addendum_revisions BEGIN SELECT RAISE(ABORT, 'history is permanent'); END;
+CREATE INDEX IF NOT EXISTS idx_addendum_revisions_addendum ON addendum_revisions(addendum_id);
 CREATE TABLE IF NOT EXISTS poi_revisions(
   id INTEGER PRIMARY KEY, tag_id INTEGER NOT NULL REFERENCES tags(id), description TEXT NOT NULL, aliases TEXT NOT NULL,
   edited_by INTEGER NOT NULL REFERENCES users(id), edited_at TEXT NOT NULL DEFAULT (${NOW}));
@@ -148,6 +158,19 @@ if (!db.prepare('SELECT 1 FROM categories LIMIT 1').get()) {
 for (const [col, ddl] of [['clearance', 'INTEGER NOT NULL DEFAULT 0'], ['cover_name', 'TEXT']]) {
   if (!db.prepare("SELECT 1 FROM pragma_table_info('users') WHERE name = ?").get(col)) db.exec(`ALTER TABLE users ADD COLUMN ${col} ${ddl}`);
 }
+// ---- removing an account that has authored anything (reports, revisions, addenda, attachments,
+// faction/POI history — all permanent records that reference the author by id) can't drop the row
+// outright without either orphaning that history's foreign key or, worse, silently hiding it (every
+// report/revision/addendum query in server/index.js INNER JOINs users to read the author's callsign,
+// so a deleted row would make their own past reports vanish for everyone, not just remove the account).
+// Instead the row stays, satisfying every reference, and removed_at/removed_by mark it retired: the
+// login and session-auth checks in server/index.js both refuse a removed account, and the personnel
+// list leaves it out, so functionally the person is gone — only their attributed history still reads
+// "by <callsign>" the way it always did. This is the same soft-delete shape as reports/attachments
+// (deleted_at/deleted_by) elsewhere in this schema, just applied to users.
+for (const [col, ddl] of [['removed_at', 'TEXT'], ['removed_by', 'INTEGER REFERENCES users(id)']]) {
+  if (!db.prepare("SELECT 1 FROM pragma_table_info('users') WHERE name = ?").get(col)) db.exec(`ALTER TABLE users ADD COLUMN ${col} ${ddl}`);
+}
 if (!db.prepare("SELECT 1 FROM pragma_table_info('reports') WHERE name = 'clearance'").get()) {
   db.exec('ALTER TABLE reports ADD COLUMN clearance INTEGER NOT NULL DEFAULT 0');
 }
@@ -178,6 +201,11 @@ CREATE TABLE IF NOT EXISTS faction_members(
   updated_at TEXT NOT NULL DEFAULT (${NOW}));
 CREATE INDEX IF NOT EXISTS idx_faction_members_faction ON faction_members(faction_id);
 `);
+// A roster's own display order, dragged into place per faction — independent of when a member
+// was added or their name, unlike the created_at/name ordering everything else in this file uses.
+if (!db.prepare("SELECT 1 FROM pragma_table_info('faction_members') WHERE name = 'sort_order'").get()) {
+  db.exec('ALTER TABLE faction_members ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0');
+}
 
 // The field-messages feature (a Warden leaving a note at a Hold for a specific informant) was
 // removed. A database that already created the table keeps it, harmlessly unused — dropping it
@@ -207,6 +235,7 @@ const DELETE_GUARDS = {
   reports_no_delete: "CREATE TRIGGER reports_no_delete BEFORE DELETE ON reports BEGIN SELECT RAISE(ABORT, 'reports are never deleted'); END",
   rev_no_del: "CREATE TRIGGER rev_no_del BEFORE DELETE ON report_revisions BEGIN SELECT RAISE(ABORT, 'history is permanent'); END",
   add_no_del: "CREATE TRIGGER add_no_del BEFORE DELETE ON addenda BEGIN SELECT RAISE(ABORT, 'addenda are permanent'); END",
+  addrev_no_del: "CREATE TRIGGER addrev_no_del BEFORE DELETE ON addendum_revisions BEGIN SELECT RAISE(ABORT, 'history is permanent'); END",
   attach_no_del: "CREATE TRIGGER attach_no_del BEFORE DELETE ON attachments BEGIN SELECT RAISE(ABORT, 'attachments are permanent'); END",
   poirev_no_del: "CREATE TRIGGER poirev_no_del BEFORE DELETE ON poi_revisions BEGIN SELECT RAISE(ABORT, 'history is permanent'); END",
 };

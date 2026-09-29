@@ -9,6 +9,18 @@ import { db, COVER_NAMES, hardDelete, cascadeDelete } from './db.js';
 const MAX_CLEARANCE = 5; // 0 = everyone, 5 = Warden-tier
 const REVEAL_CLEARANCE = 3; // clearance level at which the "Manifesto" brand itself stops being hidden
 
+// ---- small shared helpers used across otherwise-unrelated routes below ----
+// A Warden always passes; anyone else needs their own clearance to be at or above the level being
+// checked. Reports layer more onto this (author, individual grants — see cleared() near the reports
+// section); a faction or POI file's own "am I cleared for this" check is exactly this and nothing more.
+const clearanceOk = (viewer, level) => viewer.role === 'warden' || (viewer.clearance || 0) >= level;
+// The same 400 (`Clearance must be 0-N`) is hand-checked on four separate PATCH .../clearance routes
+// below; this is that one validation, returning the clamped integer or null for "reject with 400".
+const parseClearance = (v) => { const c = parseInt(v, 10); return Number.isInteger(c) && c >= 0 && c <= MAX_CLEARANCE ? c : null; };
+// A handful of routes just need "does this id exist in this table" as a 404 gate or inline check —
+// table is always a fixed string at the call site below, never user input.
+const existsIn = (table, id) => !!db.prepare(`SELECT 1 FROM "${table}" WHERE id = ?`).get(id);
+
 const app = express();
 const PROD = process.env.NODE_ENV === 'production';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -69,7 +81,7 @@ const cookie = (req, n) => (req.headers.cookie || '').split(';').map((c) => c.tr
 app.use((req, _res, next) => {
   const t = cookie(req, 'mf');
   if (t) req.user = db.prepare(`SELECT u.id, u.callsign, u.role, u.clearance, u.cover_name FROM sessions s JOIN users u ON u.id = s.user_id
-    WHERE s.token_hash = ? AND s.expires_at > ?`).get(sha(t), Date.now());
+    WHERE s.token_hash = ? AND s.expires_at > ? AND u.removed_at IS NULL`).get(sha(t), Date.now());
   // The brand itself is part of what clearance gates: below the reveal level (and not the Warden),
   // the header shows a cover name instead of "Manifesto" — see the user's "Also new idea" spec.
   if (req.user) req.user.brand = (req.user.role === 'warden' || req.user.clearance >= REVEAL_CLEARANCE) ? 'Manifesto' : (req.user.cover_name || 'Manifesto');
@@ -108,6 +120,19 @@ setInterval(() => { // sweep every tracked window so a long-running process does
   }
 }, 5 * 60_000).unref();
 
+// A rotating line of flavor text for the pre-login screen — one message per line in splash.txt,
+// read once at boot (same reasoning as DUMMY_HASH, above: this is small, static, server-authored
+// content, not something that needs re-reading from disk on every request). Missing or empty file
+// just means no splash line shows; not worth failing requests over.
+const SPLASH_MESSAGES = (() => {
+  try { return fs.readFileSync(path.join(HERE, 'splash.txt'), 'utf8').split('\n').map((s) => s.trim()).filter(Boolean); }
+  catch { return []; }
+})();
+// Public — no need(), since this renders on the screen shown before anyone has signed in.
+app.get('/api/splash', (_req, res) => res.json({
+  message: SPLASH_MESSAGES.length ? SPLASH_MESSAGES[Math.floor(Math.random() * SPLASH_MESSAGES.length)] : '',
+}));
+
 /* ---------- auth routes ---------- */
 app.post('/api/auth/signup', (req, res) => {
   if (locked('signup', req.ip)) return res.status(429).json({ error: 'Too many attempts. Wait a while.' });
@@ -134,6 +159,7 @@ app.post('/api/auth/login', (req, res) => {
   const u = db.prepare('SELECT * FROM users WHERE callsign = ?').get(c);
   const ok = u ? checkPw(p, u.pass_hash) : (checkPw(p, DUMMY_HASH), false); // always pay the scrypt cost, real account or not
   if (!ok) { strike('combo', combo); strike('ip', ip); strike('account', account); return res.status(401).json({ error: 'Callsign or passphrase not recognised' }); }
+  if (u.removed_at) return res.status(403).json({ error: 'This account has been removed' });
   if (u.role === 'pending') return res.status(403).json({ error: 'Awaiting the Warden' });
   startSession(res, u.id);
   res.json({ id: u.id, callsign: u.callsign, role: u.role });
@@ -161,7 +187,8 @@ app.post('/api/me/password', need(), (req, res) => {
 });
 
 /* ---------- personnel (Warden) ---------- */
-app.get('/api/users', need('warden'), (_req, res) => res.json(db.prepare('SELECT id, callsign, role, clearance, created_at FROM users ORDER BY id').all()));
+app.get('/api/users', need('warden'), (_req, res) => res.json(db.prepare(
+  'SELECT id, callsign, role, clearance, created_at FROM users WHERE removed_at IS NULL ORDER BY id').all()));
 app.patch('/api/users/:id', need('warden'), (req, res) => {
   const id = +req.params.id, role = req.body?.role;
   if (!['warden', 'agent', 'pending'].includes(role)) return res.status(400).json({ error: 'Bad role' });
@@ -171,32 +198,47 @@ app.patch('/api/users/:id', need('warden'), (req, res) => {
   res.json({ ok: true });
 });
 app.patch('/api/users/:id/clearance', need('warden'), (req, res) => {
-  const id = +req.params.id, clearance = parseInt(req.body?.clearance, 10);
-  if (!Number.isInteger(clearance) || clearance < 0 || clearance > MAX_CLEARANCE) return res.status(400).json({ error: `Clearance must be 0-${MAX_CLEARANCE}` });
+  const id = +req.params.id, clearance = parseClearance(req.body?.clearance);
+  if (clearance === null) return res.status(400).json({ error: `Clearance must be 0-${MAX_CLEARANCE}` });
   db.prepare('UPDATE users SET clearance = ? WHERE id = ?').run(clearance, id);
   res.json({ ok: true });
 });
-app.delete('/api/users/:id', need('warden'), (req, res) => { // deny an application; a pending account that never authored anything can go away cleanly
+app.delete('/api/users/:id', need('warden'), (req, res) => { // deny an application — a Warden suspends an active account back to pending first, then denies it same as any other
   const id = +req.params.id;
-  const u = db.prepare('SELECT role FROM users WHERE id = ?').get(id);
-  if (!u) return res.status(404).json({ error: 'Not found' });
-  if (u.role !== 'pending') return res.status(400).json({ error: 'Only a pending application can be denied this way — suspend an existing account instead' });
+  const u = db.prepare('SELECT role, removed_at FROM users WHERE id = ?').get(id);
+  if (!u || u.removed_at) return res.status(404).json({ error: 'Not found' });
+  if (u.role !== 'pending') return res.status(400).json({ error: 'Only a pending application can be denied this way — suspend an existing account first' });
   // A pending account can still be one this Warden earlier suspended, and a suspended agent may
   // have filed reports, revisions, addenda, attachments or person-of-interest history while active —
-  // all of which are permanent records that reference their author. Rather than let the delete hit
-  // that foreign-key wall as a raw 500, check for it up front and explain why they can only be
-  // suspended, not removed.
+  // all of which are permanent records that reference their author by id. That history has to survive
+  // the account going away, so it decides how the row leaves rather than whether it can.
   const authored = db.prepare(`SELECT
       (SELECT 1 FROM reports WHERE author_id = ?) OR
       (SELECT 1 FROM report_revisions WHERE edited_by = ?) OR
       (SELECT 1 FROM addenda WHERE author_id = ?) OR
+      (SELECT 1 FROM addendum_revisions WHERE edited_by = ?) OR
       (SELECT 1 FROM attachments WHERE uploaded_by = ?) OR
-      (SELECT 1 FROM poi_revisions WHERE edited_by = ?) AS any`).get(id, id, id, id, id).any;
-  if (authored) return res.status(400).json({ error: 'This callsign has filed reports of their own — that history is permanent, so the account can only stay suspended, not be removed' });
-  // A notes thread is a permanent record too, but unlike reports it has no author-history reason to
-  // block removal — it just needs to survive the account going away. Snapshot the callsign into
-  // member_label (so a Warden can still tell whose thread it was) and clear the pointers that would
-  // otherwise foreign-key-block the delete below.
+      (SELECT 1 FROM poi_revisions WHERE edited_by = ?) OR
+      (SELECT 1 FROM faction_members WHERE updated_by = ?) OR
+      (SELECT 1 FROM access_grants WHERE granted_by = ?) AS any`)
+    .get(id, id, id, id, id, id, id, id).any;
+  if (authored) {
+    // Every one of those tables' foreign keys is NOT NULL and immutable (reports.author_id, etc. —
+    // see server/db.js), and the reports/revisions/addenda queries below all INNER JOIN users to read
+    // the author's callsign, so literally deleting this row would silently drop their own past
+    // reports out of every listing, not just remove the account. Retiring it in place — removed_at,
+    // sessions killed — reads exactly like a removal (can't log in, gone from Personnel) while every
+    // report, revision, addendum and attachment they ever touched keeps its "by <callsign>" intact.
+    db.transaction(() => {
+      db.prepare('UPDATE users SET removed_at = ?, removed_by = ? WHERE id = ?').run(new Date().toISOString(), req.user.id, id);
+      db.prepare('DELETE FROM sessions WHERE user_id = ?').run(id);
+    })();
+    return res.json({ ok: true });
+  }
+  // Nothing permanent points at this one, so the row itself can go. A notes thread is still a
+  // permanent record, but unlike reports it has no author-history reason to block removal — it just
+  // needs to survive the account going away. Snapshot the callsign into member_label (so a Warden can
+  // still tell whose thread it was) and clear the pointers that would otherwise foreign-key-block this.
   const callsign = db.prepare('SELECT callsign FROM users WHERE id = ?').get(id)?.callsign || null;
   const changes = db.transaction(() => {
     db.prepare('UPDATE notes_threads SET member_id = NULL, member_label = COALESCE(member_label, ?) WHERE member_id = ?').run(callsign, id);
@@ -228,7 +270,14 @@ app.post('/api/tags', need(), (req, res) => {
     const cid = db.prepare('SELECT id FROM categories WHERE name = ?').get(c).id;
     db.prepare('INSERT OR IGNORE INTO tags(category_id, name) VALUES(?,?)').run(cid, n);
     const tid = db.prepare('SELECT id FROM tags WHERE category_id = ? AND name = ?').get(cid, n).id;
-    backfill(tid); return tid;
+    backfill(tid);
+    // A Faction tag posted with the same name as an existing faction also backfills every one of
+    // that faction's members' mentions — not just the faction name's own literal mentions above.
+    if (c.trim().toLowerCase() === 'faction') {
+      const f = db.prepare('SELECT id FROM factions WHERE name = ? COLLATE NOCASE').get(n);
+      if (f) db.prepare('SELECT name FROM faction_members WHERE faction_id = ?').all(f.id).forEach((m) => backfillName(tid, m.name));
+    }
+    return tid;
   })();
   res.status(201).json({ id });
 });
@@ -249,29 +298,54 @@ const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const namesOf = (t) => [t.name, ...String(t.aliases || '').split(',').map((a) => a.trim())].filter(Boolean);
 const mentions = (t, text) => namesOf(t).some((n) => new RegExp(`\\b${esc(n)}(e?s)?\\b`, 'i').test(text));
 const TAGS = 'SELECT t.id, t.name, p.aliases, p.deleted_at FROM tags t LEFT JOIN poi_profiles p ON p.tag_id = t.id';
+// A faction member's name auto-tags their faction, the same way a person's name auto-tags their
+// own Person-category tag — matched loosely by name, not a stored foreign key, the same way a Hold
+// tag matches the HOLDS map in the frontend. Only fires when a Faction-category tag with the exact
+// faction name actually exists (a faction with no matching tag just doesn't auto-tag).
+const FACTION_MEMBER_TAGS = () => db.prepare(`
+  SELECT m.name, t.id AS tagId FROM faction_members m JOIN factions f ON f.id = m.faction_id
+  JOIN categories c ON c.name = 'Faction' JOIN tags t ON t.category_id = c.id AND t.name = f.name COLLATE NOCASE`).all();
+const factionTagId = (factionId) => db.prepare(`
+  SELECT t.id FROM factions f JOIN categories c ON c.name = 'Faction' JOIN tags t ON t.category_id = c.id AND t.name = f.name COLLATE NOCASE
+  WHERE f.id = ?`).get(factionId)?.id;
 const tagText = (rid, text, manual = []) => { // tags are only ever added to a report, never removed
   const ins = db.prepare('INSERT OR IGNORE INTO report_tags(report_id, tag_id, auto) SELECT ?, id, ? FROM tags WHERE id = ?');
   db.prepare(TAGS).all().filter((t) => !t.deleted_at && mentions(t, text)).forEach((t) => ins.run(rid, 1, t.id)); // a redacted person is never auto-tagged
+  FACTION_MEMBER_TAGS().forEach((m) => new RegExp(`\\b${esc(m.name)}(e?s)?\\b`, 'i').test(text) && ins.run(rid, 1, m.tagId));
   manual.forEach((t) => ins.run(rid, 0, t));
+};
+const ALL_REPORT_TEXT = `SELECT id AS rid, title || ' ' || body AS x FROM reports UNION ALL SELECT report_id, title || ' ' || body FROM report_revisions
+  UNION ALL SELECT report_id, body FROM addenda`;
+// Shared core for both backfill helpers below: scan every report's current text, every past
+// revision, and every addendum, and auto-tag whichever ones match `test`.
+const backfillMatch = (tagId, test) => {
+  const ins = db.prepare('INSERT OR IGNORE INTO report_tags(report_id, tag_id, auto) VALUES(?,?,1)');
+  db.prepare(ALL_REPORT_TEXT).all().forEach((r) => test(r.x) && ins.run(r.rid, tagId));
 };
 const backfill = (tagId) => { // a new tag or person also claims older reports that mention it
   const t = db.prepare(TAGS + ' WHERE t.id = ?').get(tagId); if (!t) return;
-  const ins = db.prepare('INSERT OR IGNORE INTO report_tags(report_id, tag_id, auto) VALUES(?,?,1)');
-  db.prepare(`SELECT id AS rid, title || ' ' || body AS x FROM reports UNION ALL SELECT report_id, title || ' ' || body FROM report_revisions
-    UNION ALL SELECT report_id, body FROM addenda`).all().forEach((r) => mentions(t, r.x) && ins.run(r.rid, tagId));
+  backfillMatch(tagId, (x) => mentions(t, x));
+};
+// Same idea as backfill() above, but keyed on a plain name (a faction member) rather than a tags
+// row — used when a member is added/renamed, or a Faction tag is created after the fact.
+const backfillName = (tagId, name) => {
+  if (!tagId || !name) return;
+  const rx = new RegExp(`\\b${esc(name)}(e?s)?\\b`, 'i');
+  backfillMatch(tagId, (x) => rx.test(x));
 };
 const CONF = ['rumour', 'witnessed', 'confirmed'];
 const conf = (c) => (CONF.includes(c) ? c : null);
 const srcId = (n) => { n = String(n || '').trim().slice(0, 60); if (!n) return null; db.prepare('INSERT OR IGNORE INTO sources(name) VALUES(?)').run(n); return db.prepare('SELECT id FROM sources WHERE name = ?').get(n).id; };
 
-// A word-for-word scramble: every run of letters/digits becomes random characters of random
-// length, so a locked-out reader can tell a report exists and roughly how long it is — nothing
-// more. Case of the first letter is kept so the scramble doesn't visibly flatten sentence starts.
+// A word-for-word scramble: every whitespace-delimited token — including punctuation like \, *, |
+// that used to pass through untouched — becomes a fresh random word of random length, so a
+// locked-out reader can tell a report exists and roughly how long it is — nothing more. Case of
+// the first letter is kept so the scramble doesn't visibly flatten sentence starts.
 const scrambleWord = (w) => {
-  let out = ''; for (let i = 0, n = 2 + Math.floor(Math.random() * 9); i < n; i++) out += String.fromCharCode(97 + Math.floor(Math.random() * 26));
+  let out = ''; for (let i = 0, n = 2 + Math.floor(Math.random() * 7); i < n; i++) out += String.fromCharCode(97 + Math.floor(Math.random() * 26));
   return /^[\p{Lu}]/u.test(w) ? out[0].toUpperCase() + out.slice(1) : out;
 };
-const scramble = (s) => String(s || '').replace(/[\p{L}\p{N}]+/gu, scrambleWord);
+const scramble = (s) => String(s || '').replace(/\S+/gu, scrambleWord);
 
 const SELECT = `SELECT r.id, r.title, r.body, r.confidence, s.name AS source, r.created_at, r.filed_at, r.deleted_at, r.author_id, r.clearance, u.callsign AS author
   FROM reports r JOIN users u ON u.id = r.author_id LEFT JOIN sources s ON s.id = r.source_id`;
@@ -287,6 +361,11 @@ const hydrate = (rows, viewer) => {
   const rv = all(`SELECT v.id, v.report_id, v.title, v.body, v.confidence, s.name AS source, v.note, v.edited_at, u.callsign AS editor FROM report_revisions v JOIN users u ON u.id = v.edited_by LEFT JOIN sources s ON s.id = v.source_id WHERE v.report_id IN (${m}) ORDER BY v.id`, ...ids);
   const at = all(`SELECT id, report_id, original_name, mime, size, created_at FROM attachments WHERE report_id IN (${m}) AND deleted_at IS NULL ORDER BY id`, ...ids);
   const ad = all(`SELECT n.id, n.report_id, n.body, n.confidence, s.name AS source, n.created_at, u.callsign AS author FROM addenda n JOIN users u ON u.id = n.author_id LEFT JOIN sources s ON s.id = n.source_id WHERE n.report_id IN (${m}) ORDER BY n.id`, ...ids);
+  // An addendum can be amended like a report — the row above stays the original forever, the
+  // latest edit (if any) is what's actually shown, same merge pattern as a report's own revisions.
+  const arv = all(`SELECT v.id, v.addendum_id, v.body, v.confidence, s.name AS source, v.note, v.edited_at, u.callsign AS editor
+    FROM addendum_revisions v JOIN addenda n ON n.id = v.addendum_id JOIN users u ON u.id = v.edited_by LEFT JOIN sources s ON s.id = v.source_id
+    WHERE n.report_id IN (${m}) ORDER BY v.id`, ...ids);
   const role = viewer?.role;
   const grantedIds = viewer && role !== 'warden'
     ? new Set(all(`SELECT report_id FROM access_grants WHERE user_id = ? AND report_id IN (${m})`, viewer.id, ...ids).map((g) => g.report_id))
@@ -296,7 +375,7 @@ const hydrate = (rows, viewer) => {
   // opened yet. Only meaningful once a report is actually readable, so it's left off a scrambled one.
   const readIds = viewer ? new Set(all(`SELECT report_id FROM report_reads WHERE user_id = ? AND report_id IN (${m})`, viewer.id, ...ids).map((x) => x.report_id)) : null;
   return rows.map((r) => {
-    const full = !viewer || role === 'warden' || r.author_id === viewer.id || r.clearance <= (viewer.clearance || 0) || grantedIds.has(r.id);
+    const full = !viewer || clearanceOk(viewer, r.clearance) || r.author_id === viewer.id || grantedIds.has(r.id);
     const v = rv.filter((x) => x.report_id === r.id), c = v.at(-1);
     const tags = tg.filter((x) => x.report_id === r.id && !(x.poi_deleted && role !== 'warden')) // a redacted person's tag is hidden from non-Wardens
       .map(({ poi_deleted, ...x }) => x)
@@ -314,17 +393,25 @@ const hydrate = (rows, viewer) => {
       ...r, original: { title: r.title, body: r.body, confidence: r.confidence, source: r.source },
       ...(c ? { title: c.title, body: c.body, confidence: c.confidence, source: c.source } : {}),
       tags, unread: !!viewer && !readIds.has(r.id),
-      revisions: [...v].reverse(), attachments: at.filter((x) => x.report_id === r.id), addenda: ad.filter((x) => x.report_id === r.id),
+      revisions: [...v].reverse(), attachments: at.filter((x) => x.report_id === r.id),
+      addenda: ad.filter((x) => x.report_id === r.id).map((n) => {
+        const nv = arv.filter((x) => x.addendum_id === n.id), nc = nv.at(-1);
+        return {
+          ...n, original: { body: n.body, confidence: n.confidence, source: n.source },
+          ...(nc ? { body: nc.body, confidence: nc.confidence, source: nc.source } : {}),
+          revisions: [...nv].reverse(),
+        };
+      }),
     };
   });
 };
 const one = (id, viewer) => hydrate(db.prepare(`${SELECT} WHERE r.id = ?`).all(id), viewer)[0];
-const exists = (req, res, next) => (db.prepare('SELECT 1 FROM reports WHERE id = ?').get(+req.params.id) ? next() : res.status(404).json({ error: 'Not found' }));
+const exists = (req, res, next) => (existsIn('reports', +req.params.id) ? next() : res.status(404).json({ error: 'Not found' }));
 // Same full-access test hydrate() uses, as a quick gate for the write routes below — you can't
 // amend, addend or attach to a report you aren't cleared to actually read.
 const cleared = (id, viewer) => {
   const r = db.prepare('SELECT author_id, clearance FROM reports WHERE id = ?').get(id);
-  return !r || viewer.role === 'warden' || r.author_id === viewer.id || r.clearance <= (viewer.clearance || 0)
+  return !r || clearanceOk(viewer, r.clearance) || r.author_id === viewer.id
     || !!db.prepare('SELECT 1 FROM access_grants WHERE report_id = ? AND user_id = ?').get(id, viewer.id);
 };
 
@@ -334,12 +421,13 @@ app.post('/api/reports', need(), (req, res) => {
   const occ = req.body?.occurredAt ? new Date(req.body.occurredAt) : new Date(); // when it happened (retroactive filing allowed)
   if (isNaN(occ) || occ > Date.now() + 3e5) return res.status(400).json({ error: 'Invalid or future event time' });
   const manual = Array.isArray(req.body?.tagIds) ? req.body.tagIds.filter(Number.isInteger) : [];
-  // An agent's own filing is always locked to the highest clearance — Warden-only — so agents never
-  // see each other's reports by default, only their own; a Warden can loosen that afterward (below).
-  // Only a Warden can choose a lower clearance at filing time.
+  // A filing defaults to the poster's own clearance level — the highest clearance they hold — so it
+  // reads as visible to themself and anyone else at or above that level, same as they already see it.
+  // A Warden can still choose a different clearance explicitly at filing time; an agent cannot.
+  const reqClearance = parseInt(req.body?.clearance, 10);
   const clearance = req.user.role === 'warden'
-    ? Math.max(0, Math.min(MAX_CLEARANCE, parseInt(req.body?.clearance, 10) || 0))
-    : MAX_CLEARANCE;
+    ? Math.max(0, Math.min(MAX_CLEARANCE, Number.isInteger(reqClearance) ? reqClearance : (req.user.clearance || 0)))
+    : (req.user.clearance || 0);
   const id = db.transaction(() => {
     const rid = db.prepare('INSERT INTO reports(title, body, author_id, created_at, confidence, source_id, clearance) VALUES(?,?,?,?,?,?,?)')
       .run(title, body, req.user.id, occ.toISOString(), conf(req.body.confidence), srcId(req.body.source), clearance).lastInsertRowid;
@@ -388,7 +476,41 @@ app.post('/api/reports/:id/addenda', need(), exists, (req, res) => {
   })();
   res.status(201).json(one(id, req.user));
 });
+/* An addendum can be amended the same way a report can: any cleared viewer may edit it (not just
+   its author, matching how report edits work), the original stays intact forever in the addenda
+   table, and every version — original plus each edit — is kept in addendum_revisions. */
+app.post('/api/addenda/:id/edit', need(), (req, res) => {
+  const id = +req.params.id, a = db.prepare('SELECT report_id FROM addenda WHERE id = ?').get(id);
+  if (!a) return res.status(404).json({ error: 'Not found' });
+  const r = db.prepare('SELECT deleted_at FROM reports WHERE id = ?').get(a.report_id);
+  if (r.deleted_at) return res.status(400).json({ error: 'That report is redacted' });
+  if (!cleared(a.report_id, req.user)) return res.status(403).json({ error: 'You are not cleared to read this report' });
+  const body = String(req.body?.body || '').trim().slice(0, 4000);
+  if (!body) return res.status(400).json({ error: 'An addendum needs some text' });
+  db.transaction(() => {
+    db.prepare('INSERT INTO addendum_revisions(addendum_id, body, confidence, source_id, note, edited_by) VALUES(?,?,?,?,?,?)')
+      .run(id, body, conf(req.body.confidence), srcId(req.body.source), String(req.body.note || '').slice(0, 200), req.user.id);
+    tagText(a.report_id, body); // names mentioned in the edited text also tag the report
+  })();
+  res.json(one(a.report_id, req.user));
+});
 app.get('/api/sources', need(), (_req, res) => res.json(db.prepare('SELECT name FROM sources ORDER BY name').all().map((x) => x.name)));
+
+// A tag can be added or removed straight from the open report, without going through Edit at all —
+// unlike an edit, this never touches title/body or creates a revision, it's just the report_tags
+// join row. Same clearance gate as editing: you can't tag what you aren't cleared to read.
+app.post('/api/reports/:id/tags', need(), exists, (req, res) => {
+  if (!cleared(+req.params.id, req.user)) return res.status(403).json({ error: 'You are not cleared to read this report' });
+  const tagId = +req.body?.tagId;
+  if (!existsIn('tags', tagId)) return res.status(400).json({ error: 'No such tag' });
+  db.prepare('INSERT OR IGNORE INTO report_tags(report_id, tag_id, auto) VALUES(?,?,0)').run(+req.params.id, tagId);
+  res.json(one(+req.params.id, req.user));
+});
+app.delete('/api/reports/:id/tags/:tagId', need(), exists, (req, res) => {
+  if (!cleared(+req.params.id, req.user)) return res.status(403).json({ error: 'You are not cleared to read this report' });
+  db.prepare('DELETE FROM report_tags WHERE report_id = ? AND tag_id = ?').run(+req.params.id, +req.params.tagId);
+  res.json(one(+req.params.id, req.user));
+});
 
 /* ---------- attachments: PDFs and images clipped to a report ---------- */
 const ATTACH_MIME = new Set(['application/pdf', 'image/png', 'image/jpeg', 'image/webp', 'image/gif']);
@@ -440,7 +562,7 @@ app.get('/api/pois', need(), (req, res) => {
     FROM tags t JOIN categories c ON c.id = t.category_id AND c.name = 'Person' LEFT JOIN poi_profiles p ON p.tag_id = t.id
     LEFT JOIN report_tags rt ON rt.tag_id = t.id LEFT JOIN reports r ON r.id = rt.report_id AND r.deleted_at IS NULL
     ${showRedacted ? '' : 'WHERE p.deleted_at IS NULL'} GROUP BY t.id ORDER BY n DESC, t.name`).all();
-  const full = (p) => req.user.role === 'warden' || (req.user.clearance || 0) >= p.clearance;
+  const full = (p) => clearanceOk(req.user, p.clearance);
   // Below clearance: the name and report count still show (so two agents don't separately file
   // on the same person without knowing it), but the level itself is never handed over — same as
   // a locked report, all a viewer gets is that they aren't cleared, not what would clear them.
@@ -504,17 +626,24 @@ app.delete('/api/pois/:id/purge', need('warden'), (req, res) => {
   res.json({ ok: true });
 });
 app.patch('/api/pois/:id/clearance', need('warden'), (req, res) => {
-  const clearance = parseInt(req.body?.clearance, 10);
-  if (!Number.isInteger(clearance) || clearance < 0 || clearance > MAX_CLEARANCE) return res.status(400).json({ error: `Clearance must be 0-${MAX_CLEARANCE}` });
+  const clearance = parseClearance(req.body?.clearance);
+  if (clearance === null) return res.status(400).json({ error: `Clearance must be 0-${MAX_CLEARANCE}` });
   const tagId = +req.params.id;
-  if (!db.prepare('SELECT 1 FROM tags WHERE id = ?').get(tagId)) return res.status(404).json({ error: 'Not found' });
+  if (!existsIn('tags', tagId)) return res.status(404).json({ error: 'Not found' });
   db.prepare(`INSERT INTO poi_profiles(tag_id, description, aliases, clearance) VALUES(?, '', '', ?)
     ON CONFLICT(tag_id) DO UPDATE SET clearance = excluded.clearance`).run(tagId, clearance);
   res.json({ ok: true });
 });
 
+// Allowlisted so `sort` can only ever become one of these exact ORDER BY clauses — never string
+// concatenated straight from the query param.
+const SORTS = {
+  'time-desc': 'r.created_at DESC', 'time-asc': 'r.created_at ASC',
+  'poster': 'u.callsign COLLATE NOCASE ASC, r.created_at DESC',
+  'clearance-desc': 'r.clearance DESC, r.created_at DESC', 'clearance-asc': 'r.clearance ASC, r.created_at DESC',
+};
 app.get('/api/reports', need(), (req, res) => {
-  const { q, tags, deleted, limit, offset } = req.query, w = [], a = [];
+  const { q, tags, deleted, limit, offset, sort } = req.query, w = [], a = [];
   if (!(deleted === '1' && req.user.role === 'warden')) w.push('r.deleted_at IS NULL');
   const words = String(q || '').match(/[\p{L}\p{N}]+/gu);
   if (words) { // searches originals, every revision, and every addendum
@@ -524,7 +653,8 @@ app.get('/api/reports', need(), (req, res) => {
     a.push(f, f, f);
   }
   for (const t of String(tags || '').split(',').filter(Boolean)) { w.push('r.id IN (SELECT report_id FROM report_tags WHERE tag_id = ?)'); a.push(+t); }
-  const rows = db.prepare(`${SELECT} ${w.length ? 'WHERE ' + w.join(' AND ') : ''} ORDER BY r.created_at DESC LIMIT ? OFFSET ?`)
+  const order = SORTS[sort] || SORTS['time-desc'];
+  const rows = db.prepare(`${SELECT} ${w.length ? 'WHERE ' + w.join(' AND ') : ''} ORDER BY ${order} LIMIT ? OFFSET ?`)
     .all(...a, Math.min(+limit || 50, 200), +offset || 0);
   res.json(hydrate(rows, req.user));
 });
@@ -557,8 +687,8 @@ app.post('/api/reports/:id/restore', need('warden'), (req, res) => {
 // this is how a report an agent locked to Warden-only (the filing default, above) gets shared
 // more broadly, or how a Warden tightens one back down.
 app.patch('/api/reports/:id/clearance', need('warden'), exists, (req, res) => {
-  const clearance = parseInt(req.body?.clearance, 10);
-  if (!Number.isInteger(clearance) || clearance < 0 || clearance > MAX_CLEARANCE) return res.status(400).json({ error: `Clearance must be 0-${MAX_CLEARANCE}` });
+  const clearance = parseClearance(req.body?.clearance);
+  if (clearance === null) return res.status(400).json({ error: `Clearance must be 0-${MAX_CLEARANCE}` });
   db.prepare('UPDATE reports SET clearance = ? WHERE id = ?').run(clearance, +req.params.id);
   res.json(one(+req.params.id, req.user));
 });
@@ -574,10 +704,10 @@ app.delete('/api/reports/:id/purge', need('warden'), exists, (req, res) => {
   const files = db.prepare('SELECT filename FROM attachments WHERE report_id = ?').all(id);
   const revIds = db.prepare('SELECT id FROM report_revisions WHERE report_id = ?').all(id).map((x) => x.id);
   const addIds = db.prepare('SELECT id FROM addenda WHERE report_id = ?').all(id).map((x) => x.id);
-  hardDelete(['reports_no_delete', 'rev_no_del', 'add_no_del', 'attach_no_del'], () => {
+  hardDelete(['reports_no_delete', 'rev_no_del', 'add_no_del', 'addrev_no_del', 'attach_no_del'], () => {
     db.prepare('DELETE FROM reports_fts WHERE rowid = ?').run(id);
     for (const rid of revIds) db.prepare('DELETE FROM rev_fts WHERE rowid = ?').run(rid);
-    for (const aid of addIds) db.prepare('DELETE FROM add_fts WHERE rowid = ?').run(aid);
+    for (const aid of addIds) { db.prepare('DELETE FROM add_fts WHERE rowid = ?').run(aid); cascadeDelete('addenda', aid); } // an addendum's own edit history, before the addendum itself goes
     cascadeDelete('reports', id); // every row anywhere that points at this report — see db.js
     db.prepare('DELETE FROM reports WHERE id = ?').run(id);
   });
@@ -591,7 +721,7 @@ app.get('/api/reports/:id/grants', need('warden'), exists, (req, res) =>
   res.json(db.prepare('SELECT g.user_id, u.callsign FROM access_grants g JOIN users u ON u.id = g.user_id WHERE g.report_id = ? ORDER BY u.callsign').all(+req.params.id)));
 app.post('/api/reports/:id/grants', need('warden'), exists, (req, res) => {
   const uid = +req.body?.userId;
-  if (!db.prepare('SELECT 1 FROM users WHERE id = ?').get(uid)) return res.status(400).json({ error: 'No such user' });
+  if (!existsIn('users', uid)) return res.status(400).json({ error: 'No such user' });
   db.prepare('INSERT OR IGNORE INTO access_grants(report_id, user_id, granted_by) VALUES(?,?,?)').run(+req.params.id, uid, req.user.id);
   res.status(201).json({ ok: true });
 });
@@ -608,14 +738,14 @@ app.delete('/api/reports/:id/grants/:userId', need('warden'), (req, res) => {
    deliberately raises one. ---------- */
 const factionCleared = (id, viewer) => {
   const f = db.prepare('SELECT clearance FROM factions WHERE id = ?').get(id);
-  return !f || viewer.role === 'warden' || (viewer.clearance || 0) >= f.clearance;
+  return !f || clearanceOk(viewer, f.clearance);
 };
-const factionExists = (req, res, next) => (db.prepare('SELECT 1 FROM factions WHERE id = ?').get(+req.params.id) ? next() : res.status(404).json({ error: 'Not found' }));
+const factionExists = (req, res, next) => (existsIn('factions', +req.params.id) ? next() : res.status(404).json({ error: 'Not found' }));
 app.get('/api/factions', need(), (req, res) => {
   const factions = db.prepare('SELECT id, name, notes, created_at, clearance FROM factions ORDER BY name').all();
-  const members = db.prepare(`SELECT m.id, m.faction_id, m.name, m.rank, m.notes, m.updated_at, u.callsign AS updated_by
-    FROM faction_members m JOIN users u ON u.id = m.updated_by ORDER BY m.name`).all();
-  const full = (f) => req.user.role === 'warden' || (req.user.clearance || 0) >= f.clearance;
+  const members = db.prepare(`SELECT m.id, m.faction_id, m.name, m.rank, m.notes, m.sort_order, m.updated_at, u.callsign AS updated_by
+    FROM faction_members m JOIN users u ON u.id = m.updated_by ORDER BY m.sort_order, m.name`).all();
+  const full = (f) => clearanceOk(req.user, f.clearance);
   // Same rule as a locked report or file: the faction's name still shows, but a viewer who isn't
   // cleared for its roster is never told the level that would clear them, only that they lack it.
   res.json(factions.map((f) => {
@@ -638,8 +768,8 @@ app.put('/api/factions/:id', need(), factionExists, (req, res) => {
   res.json({ ok: true });
 });
 app.patch('/api/factions/:id/clearance', need('warden'), factionExists, (req, res) => {
-  const clearance = parseInt(req.body?.clearance, 10);
-  if (!Number.isInteger(clearance) || clearance < 0 || clearance > MAX_CLEARANCE) return res.status(400).json({ error: `Clearance must be 0-${MAX_CLEARANCE}` });
+  const clearance = parseClearance(req.body?.clearance);
+  if (clearance === null) return res.status(400).json({ error: `Clearance must be 0-${MAX_CLEARANCE}` });
   db.prepare('UPDATE factions SET clearance = ? WHERE id = ?').run(clearance, +req.params.id);
   res.json({ ok: true });
 });
@@ -654,17 +784,31 @@ app.post('/api/factions/:id/members', need(), factionExists, (req, res) => {
   if (!factionCleared(+req.params.id, req.user)) return res.status(403).json({ error: 'You are not cleared to read this faction' });
   const b = req.body || {}, name = String(b.name || '').trim().slice(0, 80);
   if (!name) return res.status(400).json({ error: 'A name is required' });
-  const id = db.prepare('INSERT INTO faction_members(faction_id, name, rank, notes, updated_by) VALUES(?,?,?,?,?)')
-    .run(+req.params.id, name, String(b.rank || '').slice(0, 60), String(b.notes || '').slice(0, 2000), req.user.id).lastInsertRowid;
+  const next = (db.prepare('SELECT COALESCE(MAX(sort_order), -1) + 1 AS n FROM faction_members WHERE faction_id = ?').get(+req.params.id)).n;
+  const id = db.prepare('INSERT INTO faction_members(faction_id, name, rank, notes, updated_by, sort_order) VALUES(?,?,?,?,?,?)')
+    .run(+req.params.id, name, String(b.rank || '').slice(0, 60), String(b.notes || '').slice(0, 2000), req.user.id, next).lastInsertRowid;
+  backfillName(factionTagId(+req.params.id), name); // an existing report already mentioning this new member gets tagged retroactively
   res.status(201).json({ id });
+});
+// Drag-to-reorder a faction's roster: the dragged list of member ids (that faction's members, in
+// their new order) becomes each row's sort_order — index in the array. Ids from another faction,
+// or a partial list, are simply ignored rather than erroring, since the client always sends its
+// own full, current list for the faction it's reordering.
+app.patch('/api/factions/:id/members/reorder', need(), factionExists, (req, res) => {
+  if (!factionCleared(+req.params.id, req.user)) return res.status(403).json({ error: 'You are not cleared to read this faction' });
+  const order = Array.isArray(req.body?.order) ? req.body.order.filter(Number.isInteger) : [];
+  const upd = db.prepare('UPDATE faction_members SET sort_order = ? WHERE id = ? AND faction_id = ?');
+  db.transaction(() => order.forEach((id, i) => upd.run(i, id, +req.params.id)))();
+  res.json({ ok: true });
 });
 app.put('/api/faction-members/:id', need(), (req, res) => {
   const m = db.prepare('SELECT faction_id FROM faction_members WHERE id = ?').get(+req.params.id);
   if (!m) return res.status(404).json({ error: 'Not found' });
   if (!factionCleared(m.faction_id, req.user)) return res.status(403).json({ error: 'You are not cleared to read this faction' });
-  const b = req.body || {};
+  const b = req.body || {}, name = String(b.name || '').trim().slice(0, 80);
   db.prepare('UPDATE faction_members SET name = ?, rank = ?, notes = ?, updated_by = ?, updated_at = ? WHERE id = ?')
-    .run(String(b.name || '').trim().slice(0, 80), String(b.rank || '').slice(0, 60), String(b.notes || '').slice(0, 2000), req.user.id, new Date().toISOString(), +req.params.id);
+    .run(name, String(b.rank || '').slice(0, 60), String(b.notes || '').slice(0, 2000), req.user.id, new Date().toISOString(), +req.params.id);
+  backfillName(factionTagId(m.faction_id), name); // a rename also needs to catch mentions of the new name in older reports
   res.json({ ok: true });
 });
 app.delete('/api/faction-members/:id', need(), (req, res) => {

@@ -40,6 +40,12 @@ nav { display: flex; gap: 6px; flex-wrap: wrap; }
   background: color-mix(in srgb, var(--panel) 82%, transparent); backdrop-filter: blur(14px) saturate(1.1);
   -webkit-backdrop-filter: blur(14px) saturate(1.1); border: 1px solid var(--line); border-radius: 8px; padding: 16px 20px; margin-bottom: 18px;
 }
+/* .report also gets backdrop-filter above, which (like any filter) starts its own stacking context —
+   and since report cards sit later in the DOM than the panel that holds the sort dropdown, their
+   stacking contexts would otherwise paint over that panel's open, overflowing menu, hiding all but its
+   top edge. An explicit z-index here (.report stays at the default "auto", i.e. 0) lifts the whole
+   panel — dropdown included — above every report card so an open menu is never clipped by the list. */
+.panel { z-index: 2; }
 .report.redacted { border-style: dashed; }
 .meta { color: var(--dim); font-size: .9rem; }
 .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; align-items: start; } @media (max-width: 900px) { .cols { grid-template-columns: 1fr; } }
@@ -55,7 +61,9 @@ nav { display: flex; gap: 6px; flex-wrap: wrap; }
 .map { position: relative; border: 4px solid #6b4a24; border-radius: 4px; overflow: hidden; max-width: 560px; margin: 0 auto; }
 .map img { display: block; width: 100%; height: auto; }
 .pin { position: absolute; transform: translate(-50%, -50%); padding: 0; margin: 0; border-radius: 50%; border: 2px solid var(--brass);
-  background: rgba(16, 21, 27, .35); color: #fff; font-weight: 600; transition: transform .15s, background .15s; }
+  background: rgba(16, 21, 27, .35); color: #fff; font-weight: 600; transition: transform .15s, background .15s;
+  display: flex; align-items: center; justify-content: center; overflow: hidden; line-height: 1; }
+.pin span { font-size: clamp(9px, 32%, 15px); }
 .pin.hot { background: rgba(163, 58, 52, .7); } .pin:hover { transform: translate(-50%, -50%) scale(1.15); background: rgba(163, 58, 52, .9); }
 
 .heat-wrap { overflow-x: auto; padding-bottom: 6px; }
@@ -135,7 +143,16 @@ header { background: var(--bg); }
 .shred-item span { font-size: .8rem; opacity: .65; }
 
 /* ---- tag list with a hold-to-remove control ---- */
-.tag-row { display: inline-flex; align-items: center; gap: 4px; }
+/* A visible pill boundary around chip+× together, so with several tags side by side it's never
+   ambiguous which × belongs to which chip. */
+.tag-row { display: inline-flex; align-items: center; gap: 4px; margin: 3px 4px 3px 0; padding: 1px 3px 1px 1px; border-radius: 99px; border: 1px solid transparent; }
+.tag-row:has(.tag-del):hover { border-color: var(--line); background: var(--cell); }
+.tag-row .chip { margin: 0; }
+
+/* ---- faction roster drag-to-reorder ---- */
+.roster-row { cursor: grab; } .roster-row:active { cursor: grabbing; }
+.roster-row .drag-handle { color: var(--dim); width: 18px; user-select: none; }
+.roster-row:hover { background: var(--cell); }
 .hold-button.tag-del {
   width: 20px; height: 20px; min-height: 0; padding: 0; margin: 0; font-size: 12px; line-height: 1; border-radius: 99px;
   display: inline-flex; align-items: center; justify-content: center; border: 1px solid var(--line); background: var(--cell);
@@ -204,6 +221,11 @@ fieldset.bare { border: 0; padding: 0; margin: 0; min-width: 0; }
 .addenda { margin: 14px 0; padding-top: 10px; border-top: 1px solid var(--line); }
 .addendum { padding: 8px 0; border-bottom: 1px dashed var(--line); }
 .addendum:last-child { border-bottom: 0; }
+.addendum-head { display: flex; align-items: center; gap: 10px; width: 100%; text-align: left; background: none; border: 0; padding: 4px 0; color: inherit; cursor: pointer; }
+.addendum-head .meta { flex: none; }
+.addendum-preview { flex: 1; color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.addendum-chevron { color: var(--dim); }
+.addendum.open .addendum-head { padding-bottom: 8px; }
 
 /* ---- discord-style markdown: spoilers and underline ---- */
 .spoiler { background: var(--ink); color: transparent; border-radius: 3px; padding: 0 2px; cursor: pointer; transition: background .15s, color .15s; }

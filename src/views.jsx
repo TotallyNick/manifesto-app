@@ -51,10 +51,25 @@ marked.use({
     },
   },
 });
-const md = (s) => ({ __html: DOMPurify.sanitize(marked.parse(s || '')) });
+// DOMPurify's default allowlist doesn't include the plain `target` attribute (only
+// popovertarget/-action, and SVG's targetx/y) — it strips target="_blank" from every link even
+// though marked's own renderer (above) sets it, silently defeating the new-tab behaviour. rel
+// survives by default; target needs to be added back explicitly.
+const md = (s) => ({ __html: DOMPurify.sanitize(marked.parse(s || ''), { ADD_ATTR: ['target'] }) });
 const spoil = (e) => e.target.classList.contains('spoiler') && e.target.classList.toggle('revealed'); // click a spoiler span to reveal it
+// Every rendered-markdown block in the app is this same div — sanitized HTML in, a click handler
+// that reveals a ||spoiler|| span, done. `spoilable` opts a call site out of that click handler for
+// the one place (a PoiCard tile's blurb) that renders markdown as a passive preview, not something
+// to interact with.
+const Md = ({ text, className = 'md', spoilable = true, style }) => (
+  <div className={className} style={style} onClick={spoilable ? spoil : undefined} dangerouslySetInnerHTML={md(text)} />
+);
 const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const excerpt = (b) => b.replace(/[#>*_`[\]|]/g, '').replace(/\s+/g, ' ').trim().slice(0, 320);
+// A truncated slice of the raw markdown, meant to be rendered through md() rather than shown as
+// plain text — unlike excerpt() above (which strips markdown syntax for a single-line, un-rendered
+// preview), this keeps the syntax intact so bold/links/etc. still show in a list card or dossier.
+const excerptMd = (b) => (b || '').trim().slice(0, 320);
 const glow = { backgroundColor: 'var(--panel)', glowColor: '40 50 60', colors: ['#b6913e', '#a83a32', '#4c8d82'], borderRadius: 10 };
 // Reads a CSS custom property off the document root, live — used to hand the canvas-based
 // Shredder actual colour values (it can't resolve var(--x) itself), and re-reads whenever the
@@ -130,11 +145,14 @@ function MapView({ stats, active, onPick }) {
     <div className="map">
       <img src={mapImg} alt="Map of Skyrim" />
       {stats.filter((t) => t.category === 'Hold' && HOLDS[t.name]).map((t) => {
-        const [x, y] = HOLDS[t.name], s = Math.min(58, 26 + t.n * 6);
+        // Diameter is bounded (26-58px) regardless of count, and the count text itself is always
+        // shown as a fixed-width "99+" past two digits, rather than the label overflowing the
+        // circle and the pin visually looking like it's still growing.
+        const [x, y] = HOLDS[t.name], s = Math.min(58, 26 + t.n * 6), label = t.n > 99 ? '99+' : t.n || '';
         return (
           <button key={t.id} className={'pin' + (t.n ? ' hot' : '') + (active === t.id ? ' active' : '')}
             style={{ left: x + '%', top: y + '%', width: s, height: s }} onClick={() => onPick(t)}
-            title={`${t.name}: ${t.n} report(s)`}>{t.n || ''}</button>
+            title={`${t.name}: ${t.n} report(s)`}>{label && <span>{label}</span>}</button>
         );
       })}
     </div>
@@ -241,6 +259,52 @@ function Attachments({ report, me, onChange, locked }) {
 
 const SHEET_SPRING = { type: 'spring', damping: 32, stiffness: 260, mass: .9 };
 
+// A collapsed, forum-post-style card for one addendum: author/date and an excerpt, expanding to
+// the full markdown body on click — rather than every addendum always dumping its whole text
+// inline, which got unreadable once a report had more than one or two.
+// An addendum is a sub-report of its own now: it can be amended the same way a report can, with
+// the same original-plus-revisions history, shown collapsed as a forum-post-style card until opened.
+function AddendumCard({ a, onChange }) {
+  const [open, setOpen] = useState(false), [editing, setEditing] = useState(false), [hist, setHist] = useState(false);
+  const [f, setF] = useState(null), [err, setErr] = useState('');
+  const startEdit = () => { setF({ body: a.body, confidence: a.confidence || '', source: a.source || '', note: '' }); setErr(''); setEditing(true); setOpen(true); };
+  const save = () => api.post(`/addenda/${a.id}/edit`, f).then(() => { setEditing(false); onChange(); }).catch((e) => setErr(e.message));
+  return (
+    <div className={'addendum' + (open ? ' open' : '')}>
+      <button type="button" className="addendum-head" onClick={() => setOpen((o) => !o)} aria-expanded={open}>
+        <span className="meta">{stamp(a.created_at)}, {a.author}{a.revisions?.length > 0 && ' (edited)'} <Meta conf={a.confidence} source={a.source} /></span>
+        {!open && <span className="clamp addendum-preview">{excerpt(a.body)}</span>}
+        <span className="addendum-chevron" aria-hidden="true">{open ? '▾' : '▸'}</span>
+      </button>
+      {open && !editing && (<>
+        <Md text={a.body} />
+        <div className="row">
+          <button onClick={startEdit}>Edit</button>
+          {a.revisions?.length > 0 && <button onClick={() => setHist((h) => !h)}>History ({a.revisions.length})</button>}
+        </div>
+        {hist && (
+          <div className="form">
+            {a.revisions.map((v) => (
+              <details key={v.id}><summary>{stamp(v.edited_at)}, {v.editor}{v.note && `: ${v.note}`}</summary>
+                <Md text={v.body} /></details>))}
+            <details><summary>Original, {stamp(a.created_at)}, {a.author}</summary>
+              <Md text={a.original.body} /></details>
+          </div>)}
+      </>)}
+      {editing && (
+        <div className="form">
+          <textarea rows={5} value={f.body} onChange={(e) => setF({ ...f, body: e.target.value })} />
+          <div className="row"><ConfSelect value={f.confidence} onChange={(v) => setF({ ...f, confidence: v })} />
+            <SourceField value={f.source} onChange={(v) => setF({ ...f, source: v })} /></div>
+          <input placeholder="Why are you changing it? (kept in the history)" value={f.note} onChange={(e) => setF({ ...f, note: e.target.value })} />
+          <p className="dim">The original and every earlier version stay in this addendum's history.</p>
+          {err && <p className="bad">{err}</p>}
+          <div className="row"><button className="primary" onClick={save} disabled={!f.body.trim()}>Save revision</button><button onClick={() => setEditing(false)}>Cancel</button></div>
+        </div>)}
+    </div>
+  );
+}
+
 // Drag-to-shred, shared by the list-row Report card and the Dossier tile. Distinguishes a tap
 // (open the record) from a drag (pick the card up and, if released over the shredder, feed it
 // straight into the tear/fall animation) using a small movement threshold on pointer events —
@@ -319,7 +383,7 @@ function Dossier({ id, prefix, tag, title, meta, excerpt: ex, redacted, onOpen, 
       <div className="dossier-tab">{tag}</div>
       <h3>{title}</h3>
       <p className="meta">{meta}</p>
-      <p className="clamp">{ex}</p>
+      <Md text={ex} className="clamp md" />
       {redacted && <span className="dossier-stamp">REDACTED</span>}
     </motion.article>
   );
@@ -341,7 +405,8 @@ function GrantsPanel({ r, onChange }) {
       <p className="dim">Everyone below this clearance sees the report scrambled unless granted access here.</p>
       <div>{granted.map((g) => <span key={g.user_id} className="tag-row"><Chip tag={{ name: g.callsign, category: 'Person' }} on />
         <HoldButton size="sm" radius={99} holdTime={800} doneLabel="Gone" backgroundColor="transparent" textColor="var(--dim)"
-          fillColor="#a33a34" glow={false} resetAfter={400} className="tag-del" onHold={() => revoke(g.user_id)}>×</HoldButton></span>)}
+          fillColor="#a33a34" glow={false} resetAfter={400} className="tag-del" aria-label={`Revoke ${g.callsign}'s access`} title={`Revoke ${g.callsign}'s access`}
+          onHold={() => revoke(g.user_id)}>×</HoldButton></span>)}
         {!granted.length && <span className="dim">No individual grants yet.</span>}</div>
       <div className="row">
         <Sel ariaLabel="Grant access to" placeholder="Grant access to..." value={pick} onChange={setPick}
@@ -378,6 +443,18 @@ export function Report({ r, me, onChange, reveal, variant = 'list', shredder }) 
   const editTagIds = new Set([...r.tags.map((t) => t.id).filter((id) => !(f.removeIds || []).includes(id)), ...(f.addIds || [])]);
   const editTagObjs = [...r.tags, ...allTags.filter((t) => (f.addIds || []).includes(t.id))].filter((t, i, arr) => arr.findIndex((x) => x.id === t.id) === i);
   const loadTags = () => api.get('/tags').then((c) => setAllTags(c.flatMap((x) => x.tags.map((t) => ({ ...t, category: x.name })))));
+  // A brand-new tag posted from the edit picker joins the report the same way an existing one
+  // picked here does — added to addIds, applied when the revision is saved below.
+  const createTag = (c, n) => api.post('/tags', { category: c, name: n }).then(({ id }) => {
+    setF((cur) => ({ ...cur, addIds: [...(cur.addIds || []), id] })); loadTags(); return { id };
+  });
+  // Tag changes right from the open report, no Edit needed and no revision created — just the
+  // report_tags row itself. Separate from the edit-mode addIds/removeIds staging above.
+  const [quickPicker, setQuickPicker] = useState(false);
+  const quickToggle = (id) => (r.tags.some((t) => t.id === id)
+    ? api.del(`/reports/${r.id}/tags/${id}`).then(onChange)
+    : api.post(`/reports/${r.id}/tags`, { tagId: id }).then(onChange));
+  const quickCreate = (c, n) => api.post('/tags', { category: c, name: n }).then(({ id }) => quickToggle(id).then(() => ({ id })));
   const editToggle = (id) => {
     const onReport = r.tags.some((t) => t.id === id);
     if (onReport) setF((cur) => ({ ...cur, removeIds: (cur.removeIds || []).includes(id) ? cur.removeIds.filter((x) => x !== id) : [...(cur.removeIds || []), id] }));
@@ -385,7 +462,7 @@ export function Report({ r, me, onChange, reveal, variant = 'list', shredder }) 
   };
   const card = variant === 'tile' ? (
     <Dossier id={r.id} prefix="r" tag={hold ? hold.name : (r.scrambled ? 'Sealed' : 'Case file')} title={(unread ? '● ' : '') + r.title} meta={r.scrambled ? 'Beyond your clearance' : stamp(r.created_at)}
-      excerpt={r.scrambled ? '' : excerpt(r.body)} redacted={!!r.deleted_at || r.scrambled} onOpen={openReport} shredder={activeShredder} dragItem={r} />
+      excerpt={r.scrambled ? '' : excerptMd(r.body)} redacted={!!r.deleted_at || r.scrambled} onOpen={openReport} shredder={activeShredder} dragItem={r} />
   ) : (
     <motion.article layoutId={'r' + r.id} transition={SHEET_SPRING}
       className={'report card' + (r.deleted_at || r.scrambled ? ' redacted' : '') + (cd.dragging ? ' dragging-out' : '') + (cd.hot ? ' drag-hot' : '')}
@@ -395,7 +472,7 @@ export function Report({ r, me, onChange, reveal, variant = 'list', shredder }) 
       onKeyDown={(e) => e.key === 'Enter' && openReport()}>
       <h3>{unread && <span className="unread-dot" title="Unread" />}{r.title}</h3>
       <p className="meta">{stamp(r.created_at)}{r.scrambled ? '' : `, ${r.author}`} <Meta conf={r.confidence} /></p>
-      <p className="clamp">{r.scrambled ? '' : excerpt(r.body)}</p>
+      <Md text={r.scrambled ? '' : excerptMd(r.body)} className="clamp md" />
       {(r.deleted_at || r.scrambled) && <span className="dossier-stamp">{r.scrambled ? 'SEALED' : 'REDACTED'}</span>}
     </motion.article>
   );
@@ -415,15 +492,22 @@ export function Report({ r, me, onChange, reveal, variant = 'list', shredder }) 
           ) : (<>
           <h2>{r.title}</h2>
           <p className="meta">{stamp(r.created_at)}, filed by {r.author}{late && ` on ${stamp(r.filed_at)}`}{r.deleted_at && `. Redacted ${stamp(r.deleted_at)}`} <Meta conf={r.confidence} source={r.source} /></p>
-          <div className="md" onClick={spoil} dangerouslySetInnerHTML={md(r.body)} />
-          <div>{r.tags.map((t) => <Chip key={t.id} tag={t} on />)}</div>
+          <Md text={r.body} />
+          <div>{r.tags.map((t) => (
+              <span key={t.id} className="tag-row">
+                <Chip tag={t} on />
+                {!r.deleted_at && (
+                  <HoldButton size="sm" radius={99} holdTime={600} doneLabel="Off" backgroundColor="transparent" textColor="var(--dim)"
+                    fillColor="#a33a34" glow={false} resetAfter={400} className="tag-del" aria-label={`Remove ${t.name} tag`} title={`Remove ${t.name} tag`}
+                    onHold={() => quickToggle(t.id)}>×</HoldButton>)}
+              </span>))}
+            {!r.deleted_at && (
+              <button type="button" className="plus" onClick={() => { if (!allTags.length) loadTags(); setQuickPicker(true); }} aria-label="Add tags">+ Tags</button>)}</div>
+          {quickPicker && <TagPicker tags={allTags} on={new Set(r.tags.map((t) => t.id))} toggle={quickToggle} create={quickCreate} close={() => setQuickPicker(false)}
+            canDelete={me.role === 'warden'} onDeleted={() => { loadTags(); onChange(); }} />}
           {r.addenda.length > 0 && (
             <div className="addenda"><h3>Addenda</h3>
-              {r.addenda.map((a) => (
-                <div key={a.id} className="addendum">
-                  <p className="meta">{stamp(a.created_at)}, {a.author} <Meta conf={a.confidence} source={a.source} /></p>
-                  <div className="md" onClick={spoil} dangerouslySetInnerHTML={md(a.body)} />
-                </div>))}
+              {r.addenda.map((a) => <AddendumCard key={a.id} a={a} onChange={onChange} />)}
             </div>)}
           <Attachments report={r} me={me} onChange={onChange} locked={!!r.deleted_at} />
           {me.role === 'warden' && !r.deleted_at && <GrantsPanel r={r} onChange={onChange} />}
@@ -446,23 +530,28 @@ export function Report({ r, me, onChange, reveal, variant = 'list', shredder }) 
               <div>{editTagObjs.filter((t) => editTagIds.has(t.id)).map((t) => (
                   <span key={t.id} className="tag-row"><Chip tag={t} on onClick={() => editToggle(t.id)} />
                     <HoldButton size="sm" radius={99} holdTime={600} doneLabel="Off" backgroundColor="transparent" textColor="var(--dim)"
-                      fillColor="#a33a34" glow={false} resetAfter={400} className="tag-del" onHold={() => editToggle(t.id)}>×</HoldButton></span>))}
+                      fillColor="#a33a34" glow={false} resetAfter={400} className="tag-del" aria-label={`Remove ${t.name} tag`} title={`Remove ${t.name} tag`}
+                      onHold={() => editToggle(t.id)}>×</HoldButton></span>))}
                 <button type="button" className="plus" onClick={() => { if (!allTags.length) loadTags(); setEditPicker(true); }} aria-label="Add tags">+ Tags</button></div>
               <p className="dim">A name still mentioned in the text is re-tagged automatically. Remove it here only if it shouldn't apply going forward.</p>
               <input placeholder="Why are you changing it? (kept in the history)" value={f.note} onChange={set('note')} />
               <p className="dim">The original and every earlier version stay in the history.</p>
               <button className="primary" onClick={() => send('edit', { ...f, addTagIds: f.addIds, removeTagIds: f.removeIds })}>Save revision</button></div>)}
-          {editPicker && <TagPicker tags={allTags} on={editTagIds} toggle={editToggle} close={() => setEditPicker(false)}
+          {editPicker && <TagPicker tags={allTags} on={editTagIds} toggle={editToggle} create={createTag} close={() => setEditPicker(false)}
             canDelete={me.role === 'warden'} onDeleted={(id) => { setF((cur) => ({ ...cur, addIds: (cur.addIds || []).filter((x) => x !== id) })); loadTags(); }} />}
           {mode === 'addend' && (
-            <div className="form"><textarea rows={5} placeholder="Additional information, from this or a later source..." value={f.body} onChange={set('body')} />
-              <div className="row"><ConfSelect value={f.confidence} onChange={set('confidence')} /><SourceField value={f.source} onChange={set('source')} /></div>
-              <p className="dim">An addendum can't be edited or removed once posted. It's a dated statement on the record.</p>
-              <button className="primary" onClick={() => send('addenda', f)}>Post addendum</button></div>)}
+            <div className="cols">
+              <div className="form"><textarea rows={5} placeholder="Additional information, from this or a later source..." value={f.body} onChange={set('body')} />
+                <div className="row"><ConfSelect value={f.confidence} onChange={set('confidence')} /><SourceField value={f.source} onChange={set('source')} /></div>
+                <p className="dim">An addendum can't be edited or removed once posted. It's a dated statement on the record.</p>
+                <button className="primary" onClick={() => send('addenda', f)} disabled={!(f.body || '').trim()}>Post addendum</button></div>
+              <div className="panel"><h3>Preview</h3><p className="meta">{stamp(new Date().toISOString())}, {me.callsign} <Meta conf={f.confidence} source={f.source} /></p>
+                <Md text={f.body || '*Nothing written yet.*'} /></div>
+            </div>)}
           {mode === 'hist' && (
             <div className="form">{r.revisions.map((v) => (
-              <details key={v.id}><summary>{stamp(v.edited_at)}, {v.editor}{v.note && `: ${v.note}`}</summary><b>{v.title}</b><div className="md" onClick={spoil} dangerouslySetInnerHTML={md(v.body)} /></details>))}
-              <details><summary>Original, {stamp(r.filed_at)}, {r.author}</summary><b>{r.original.title}</b><div className="md" onClick={spoil} dangerouslySetInnerHTML={md(r.original.body)} /></details></div>)}
+              <details key={v.id}><summary>{stamp(v.edited_at)}, {v.editor}{v.note && `: ${v.note}`}</summary><b>{v.title}</b><Md text={v.body} /></details>))}
+              <details><summary>Original, {stamp(r.filed_at)}, {r.author}</summary><b>{r.original.title}</b><Md text={r.original.body} /></details></div>)}
           {err && <p className="bad">{err}</p>}
         </Overlay>)}</AnimatePresence>
     </>
@@ -518,13 +607,21 @@ export function Dashboard({ me, openTag, setView }) {
 const hit = (t, txt) => [t.name, ...(t.aliases || '').split(',').map((a) => a.trim())].filter(Boolean).some((n) => new RegExp(`\\b${esc(n)}(e?s)?\\b`, 'i').test(txt));
 
 function TagPicker({ tags, on, lock = [], toggle, create, close, canDelete, onDeleted }) {
-  const [q, setQ] = useState(''), [nc, setNc] = useState(''), [nt, setNt] = useState('');
+  const [q, setQ] = useState(''), [nc, setNc] = useState(''), [nt, setNt] = useState(''), [cErr, setCErr] = useState('');
   const g = {};
   tags.filter((t) => t.name.toLowerCase().includes(q.toLowerCase())).forEach((t) => (g[t.category] ||= []).push(t));
   // Every category that exists, unaffected by the filter above — a search for a tag name shouldn't
   // narrow which categories show up in the "new tag" picker below.
   const allCats = [...new Set(tags.map((t) => t.category))];
   const del = (id) => api.del('/tags/' + id).then(() => onDeleted(id)).catch(() => {});
+  // A tag with no category used to just vanish silently (create() would no-op, nothing told you
+  // why). Now a blank category or name is caught here, and any server error surfaces too, instead
+  // of the attempt disappearing without a trace.
+  const doCreate = () => {
+    setCErr('');
+    if (!nc.trim() || !nt.trim()) return setCErr('A tag needs both a category and a name.');
+    create(nc, nt).then(() => setNt('')).catch((e) => setCErr(e.message || 'Could not create that tag'));
+  };
   return (
     <div className="modal" onClick={close}>
       <div className="panel modal-card" onClick={(e) => e.stopPropagation()}>
@@ -537,14 +634,16 @@ function TagPicker({ tags, on, lock = [], toggle, create, close, canDelete, onDe
           // overflow-y scroll region if opened too close to the bottom edge.
           <div className="row"><PickOrType options={allCats} value={nc} onChange={setNc} ariaLabel="Category" placeholder="Category" addLabel="+ New category…" />
             <input placeholder="New tag" value={nt} onChange={(e) => setNt(e.target.value)} />
-            <button onClick={() => create(nc, nt).then(() => setNt(''))}>Create tag</button></div>)}
+            <button onClick={doCreate}>Create tag</button></div>)}
+        {create && cErr && <p className="bad">{cErr}</p>}
         {Object.entries(g).map(([c, ts]) => (
           <div key={c}><h3>{c}</h3>{ts.map((t) => (
             <span key={t.id} className="tag-row">
               <Chip tag={t} on={on.has(t.id)} onClick={() => !lock.includes(t.id) && toggle(t.id)} />
               {canDelete && c !== 'Person' && (
                 <HoldButton size="sm" radius={99} holdTime={1000} doneLabel="Gone" backgroundColor="transparent" textColor="var(--dim)"
-                  fillColor="#a33a34" glow={false} resetAfter={400} className="tag-del" onHold={() => del(t.id)}>×</HoldButton>)}
+                  fillColor="#a33a34" glow={false} resetAfter={400} className="tag-del" aria-label={`Delete ${t.name} tag entirely`} title={`Delete ${t.name} tag entirely`}
+                  onHold={() => del(t.id)}>×</HoldButton>)}
             </span>))}</div>))}
       </div>
     </div>
@@ -554,7 +653,9 @@ function TagPicker({ tags, on, lock = [], toggle, create, close, canDelete, onDe
 export function Compose({ done, me }) {
   const [tags, setTags] = useState([]), [title, setTitle] = useState(''), [body, setBody] = useState(''), [when, setWhen] = useState(nowInput());
   const [pick, setPick] = useState([]), [conf, setConf] = useState(''), [source, setSource] = useState(''), [picker, setPicker] = useState(false), [err, setErr] = useState(''), [locked, setLocked] = useState(false);
-  const [clearance, setClearance] = useState(0);
+  // A filing defaults to the poster's own clearance — the highest level they hold. A Warden can
+  // still change it right here before lodging; this just changes what the field starts on.
+  const [clearance, setClearance] = useState(me.clearance || 0);
   const pending = useRef(null);
   const load = () => api.get('/tags').then((c) => setTags(c.flatMap((x) => x.tags.map((t) => ({ ...t, category: x.name })))));
   useEffect(() => { load(); }, []);
@@ -596,29 +697,37 @@ export function Compose({ done, me }) {
           {err && <p className="bad">{err}</p>}
           <p className="dim">{me.role === 'warden'
             ? (clearance > 0 ? `Below Clearance: ${CLEARANCE_LABEL[clearance]}, this report reads as scrambled nonsense, it is encripted. A Warden can still grant it to specific people.` : 'Everyone can read this one.')
-            : 'Filed at Warden-only clearance. Only you and a Warden can read it, unless a Warden opens it up further.'}</p>
+            : (me.clearance > 0
+                ? `Filed at your own clearance, ${CLEARANCE_LABEL[me.clearance]}. Only those cleared to that level (or a Warden) can read it.`
+                : 'Everyone can read this one.')}</p>
           <p className="dim">After you press it, the fuse burns for one second. Press Undo before it ends and nothing is sent.</p>
           <FuseButton label="Lodge report" doneLabel="Lodged" undoLabel="Undo" undoWindow={1000} size="lg" radius={10} fuse="outline"
             background="#27272a" color="#f5f5f5" fuseColor="#e0b94a" disabled={!title.trim() || !body.trim()} onCommit={arm} onUndo={undo} onFuseEnd={fire} />
         </div>
       </BorderGlow>
       <div className="panel"><h2>{title || 'Preview'}</h2><p className="meta">{dLabel(sk(inputToIso(when)))} <Meta conf={conf} source={source} /></p>
-        <div className="md" onClick={spoil} dangerouslySetInnerHTML={md(body || '*Nothing written yet.*')} /></div>
+        <Md text={body || '*Nothing written yet.*'} /></div>
       {picker && <TagPicker tags={tags} on={on} lock={auto} toggle={toggle} create={create} close={() => setPicker(false)}
         canDelete={me.role === 'warden'} onDeleted={(id) => { setPick((p) => p.filter((x) => x !== id)); load(); }} />}
     </div>
   );
 }
 
+const SORT_OPTS = [
+  { value: 'time-desc', label: 'Newest first' }, { value: 'time-asc', label: 'Oldest first' },
+  { value: 'poster', label: 'Poster (A-Z)' },
+  { value: 'clearance-desc', label: 'Clearance (highest first)' }, { value: 'clearance-asc', label: 'Clearance (lowest first)' },
+];
 function ReportsArchive({ me, sel, setSel, view }) {
   const [q, setQ] = useState(''), [rows, setRows] = useState([]), [stats, setStats] = useState([]), [sd, setSd] = useState(false), [k, setK] = useState(0), [picker, setPicker] = useState(false);
+  const [sort, setSort] = useState('time-desc');
   const shredColor = useThemeVar('--cell', '#1b1b1d'), shredSlit = useThemeVar('--line', '#2a2a2c');
   const shredRef = useRef(null);
   useEffect(() => { api.get('/stats/tags').then(setStats); }, [k]);
   useEffect(() => {
-    const t = setTimeout(() => api.get(`/reports?q=${encodeURIComponent(q)}&tags=${sel.join(',')}&deleted=${sd ? 1 : 0}`).then(setRows), 250);
+    const t = setTimeout(() => api.get(`/reports?q=${encodeURIComponent(q)}&tags=${sel.join(',')}&deleted=${sd ? 1 : 0}&sort=${sort}`).then(setRows), 250);
     return () => clearTimeout(t);
-  }, [q, sel, sd, k]);
+  }, [q, sel, sd, k, sort]);
   const flip = (id) => setSel(sel.includes(id) ? sel.filter((x) => x !== id) : [...sel, id]);
   const shred = (item) => {
     api.post(`/reports/${item.id}/redact`);
@@ -642,6 +751,7 @@ function ReportsArchive({ me, sel, setSel, view }) {
           <div>{stats.filter((t) => sel.includes(t.id)).map((t) => <Chip key={t.id} tag={t} n={t.n} on onClick={() => flip(t.id)} />)}
             <button type="button" className="plus" onClick={() => setPicker(true)}>+ Filter by tag</button></div>
           <div className="row"><span className="dim">{rows.length} report(s)</span>
+            <Sel ariaLabel="Sort by" size="sm" value={sort} onChange={setSort} options={SORT_OPTS} />
             {sel.length > 0 && <button onClick={() => setSel([])}>Clear filters</button>}
             {isWarden && <label><input type="checkbox" checked={sd} onChange={(e) => setSd(e.target.checked)} /> show redacted</label>}</div>
         </div>
@@ -667,9 +777,26 @@ function ReportsArchive({ me, sel, setSel, view }) {
   );
 }
 
+function FactionNotes({ f, me, onChange }) {
+  const [editing, setEditing] = useState(false), [draft, setDraft] = useState(f.notes);
+  const save = () => api.put(`/factions/${f.id}`, { notes: draft }).then(() => { setEditing(false); onChange(); });
+  return editing ? (
+    <div className="form">
+      <textarea rows={4} placeholder="Notes. Markdown works." value={draft} onChange={(e) => setDraft(e.target.value)} />
+      <div className="row"><button className="primary" onClick={save}>Save</button><button onClick={() => setEditing(false)}>Cancel</button></div>
+    </div>
+  ) : (
+    <div className="row" style={{ alignItems: 'flex-start' }}>
+      <Md text={f.notes || '*No notes yet.*'} style={{ flex: 1 }} />
+      <button onClick={() => { setDraft(f.notes); setEditing(true); }}>Edit notes</button>
+    </div>
+  );
+}
+
 function FactionsArchive({ me }) {
-  const [list, setList] = useState([]), [newName, setNewName] = useState(''), [err, setErr] = useState('');
+  const [list, setList] = useState([]), [newName, setNewName] = useState(''), [err, setErr] = useState(''), [q, setQ] = useState('');
   const [memberForm, setMemberForm] = useState(null); // { factionId, id?, name, rank, notes }
+  const dragId = useRef(null);
   const load = () => api.get('/factions').then(setList);
   useEffect(() => { load(); }, []);
   const createFaction = () => {
@@ -684,15 +811,29 @@ function FactionsArchive({ me }) {
     p.then(() => { setMemberForm(null); load(); }).catch((e) => setErr(e.message));
   };
   const removeMember = (id) => api.del(`/faction-members/${id}`).then(load);
+  // Drag a roster row onto another to reorder within that faction — reordered locally right away
+  // (so it doesn't wait on a round trip), then persisted as this faction's new member order.
+  const reorder = (faction, draggedId, targetId) => {
+    if (draggedId === targetId) return;
+    const members = [...faction.members], from = members.findIndex((m) => m.id === draggedId), to = members.findIndex((m) => m.id === targetId);
+    if (from < 0 || to < 0) return;
+    const [moved] = members.splice(from, 1); members.splice(to, 0, moved);
+    setList((cur) => cur.map((f) => (f.id === faction.id ? { ...f, members } : f)));
+    api.patch(`/factions/${faction.id}/members/reorder`, { order: members.map((m) => m.id) }).catch(() => load());
+  };
+  const needle = q.trim().toLowerCase();
+  const matches = (m) => !needle || (m.name + ' ' + m.rank).toLowerCase().includes(needle);
+  const shown = list.filter((f) => !needle || f.name.toLowerCase().includes(needle) || f.members.some(matches));
   return (
     <div>
       <div className="panel">
         <h2>Faction rosters</h2>
-        <p className="dim">Who's in a faction and their rank, edited in place by whoever's tracking it, not a case file. A Warden can raise a faction's clearance to seal its roster the same way a report is sealed.</p>
+        <p className="dim">Who's in a faction and their rank, edited in place by whoever's tracking it, not a case file. A Warden can raise a faction's clearance to seal its roster the same way a report is sealed. Drag a row onto another to reorder a roster.</p>
+        <input placeholder="Search factions and members by name or rank..." value={q} onChange={(e) => setQ(e.target.value)} />
         <div className="row"><input placeholder="New faction name" value={newName} onChange={(e) => setNewName(e.target.value)} /><button onClick={createFaction}>Create faction</button></div>
         {err && <p className="bad">{err}</p>}
       </div>
-      {list.map((f) => (
+      {shown.map((f) => (
         <div key={f.id} className="panel">
           <div className="row"><h3 style={{ flex: 1 }}>{f.name}</h3>
             {!f.scrambled && <button className="plus" onClick={() => setMemberForm({ factionId: f.id, name: '', rank: '', notes: '' })}>+ Member</button>}
@@ -700,11 +841,16 @@ function FactionsArchive({ me }) {
             {me.role === 'warden' && <HB danger done="Gone" onHold={() => deleteFaction(f.id)}>Hold to disband</HB>}</div>
           {f.scrambled ? (
             <p className="dim">You lack the clearance to view this faction's roster. A Warden can raise your standing clearance, or lower this faction's.</p>
-          ) : (
+          ) : (<>
+            <FactionNotes f={f} me={me} onChange={load} />
             <table><tbody>
-              {f.members.map((m) => (
-                <tr key={m.id}>
-                  <td>{m.name}</td><td className="dim">{m.rank}</td><td className="dim">{m.notes}</td>
+              {f.members.filter(matches).map((m) => (
+                <tr key={m.id} draggable onDragStart={() => { dragId.current = m.id; }}
+                  onDragOver={(e) => e.preventDefault()} onDrop={(e) => { e.preventDefault(); if (dragId.current != null) reorder(f, dragId.current, m.id); dragId.current = null; }}
+                  className="roster-row" title="Drag to reorder">
+                  <td className="drag-handle" aria-hidden="true">⠿</td>
+                  <td>{m.name}</td><td className="dim">{m.rank}</td>
+                  <td className="dim md" onClick={spoil} dangerouslySetInnerHTML={md(m.notes)} />
                   <td className="dim">upd. {stamp(m.updated_at)} by {m.updated_by}</td>
                   <td className="row">
                     <button onClick={() => setMemberForm({ factionId: f.id, id: m.id, name: m.name, rank: m.rank, notes: m.notes })}>Edit</button>
@@ -712,17 +858,20 @@ function FactionsArchive({ me }) {
                   </td>
                 </tr>))}
               {!f.members.length && <tr><td className="dim">No members recorded yet.</td></tr>}
+              {!!f.members.length && !f.members.filter(matches).length && <tr><td className="dim">No members match "{q}".</td></tr>}
             </tbody></table>
-          )}
+          </>)}
         </div>))}
       {!list.length && <p className="dim">No factions tracked yet.</p>}
+      {!!list.length && !shown.length && <p className="dim">Nothing matches "{q}".</p>}
       {memberForm && (
         <div className="modal" onClick={() => setMemberForm(null)}>
           <div className="panel modal-card" onClick={(e) => e.stopPropagation()}>
             <h2>{memberForm.id ? 'Edit member' : 'New member'}</h2>
             <input placeholder="Name" value={memberForm.name} onChange={(e) => setMemberForm({ ...memberForm, name: e.target.value })} />
             <input placeholder="Rank" value={memberForm.rank} onChange={(e) => setMemberForm({ ...memberForm, rank: e.target.value })} />
-            <textarea rows={4} placeholder="Notes" value={memberForm.notes} onChange={(e) => setMemberForm({ ...memberForm, notes: e.target.value })} />
+            <textarea rows={4} placeholder="Notes. Markdown works." value={memberForm.notes} onChange={(e) => setMemberForm({ ...memberForm, notes: e.target.value })} />
+            <p className="dim">A name mentioned in a report auto-tags this faction, same as a person of interest.</p>
             <div className="row"><button className="primary" onClick={saveMember}>Save</button><button onClick={() => setMemberForm(null)}>Cancel</button></div>
           </div>
         </div>)}
@@ -774,9 +923,9 @@ function NoteBubble({ n, mine, otherLabel, manage }) {
           // same markdown renderer the rest of the app uses, so a note can carry the same
           // formatting (bold, links, spoilers, etc.) as everywhere else. A deleted message skips
           // straight to this (no reason to replay the reveal for something already sent).
-          <div className="md" onClick={spoil} dangerouslySetInnerHTML={md(n.body)} />
+          <Md text={n.body} />
         ) : (
-          <TextType text={n.body} speed={16} onComplete={() => setTyped(true)} />
+          <TextType text={n.body} speed={16} loop={false} onComplete={() => setTyped(true)} />
         )}
       </div>
     </div>
@@ -1024,7 +1173,7 @@ function PoiCard({ p, me, reload, openTag, variant = 'list' }) {
   const setRedaction = (on) => api.post(`/pois/${p.id}/${on ? 'redact' : 'restore'}`).then(reload).catch((e) => setErr(e.message));
   const setClearance = (c) => api.patch(`/pois/${p.id}/clearance`, { clearance: c }).then(reload).catch((e) => setErr(e.message));
   const purge = () => api.del(`/pois/${p.id}/purge`).then(() => { setOpen(false); reload(); }).catch((e) => setErr(e.message));
-  const blurb = redacted ? 'This file has been redacted.' : p.scrambled ? 'Beyond your clearance.' : (excerpt(p.description) || 'No description yet.');
+  const blurb = redacted ? 'This file has been redacted.' : p.scrambled ? 'Beyond your clearance.' : (excerptMd(p.description) || '*No description yet.*');
   const card = variant === 'tile' ? (
     <Dossier id={p.id} prefix="p" tag="Person of interest" title={p.name}
       meta={`${p.n} report(s)${p.aliases ? `, AKA ${p.aliases}` : ''}`} excerpt={blurb} redacted={redacted || p.scrambled} onOpen={() => setOpen(true)} />
@@ -1032,7 +1181,7 @@ function PoiCard({ p, me, reload, openTag, variant = 'list' }) {
     <motion.article layoutId={'p' + p.id} transition={SHEET_SPRING} className={'report card' + (redacted || p.scrambled ? ' redacted' : '')} role="button" tabIndex={0} onClick={() => setOpen(true)} onKeyDown={(e) => e.key === 'Enter' && setOpen(true)}>
       <h3>{p.name}</h3>
       <p className="meta">{p.n} report(s){p.aliases && `, also known as ${p.aliases}`}</p>
-      <p className="clamp">{blurb}</p>
+      <Md text={blurb} className="clamp md" spoilable={false} />
       {redacted && <span className="dossier-stamp">REDACTED</span>}
       {!redacted && p.scrambled && <span className="dossier-stamp">SEALED</span>}
     </motion.article>
@@ -1055,7 +1204,7 @@ function PoiCard({ p, me, reload, openTag, variant = 'list' }) {
               <div className="row"><button className="primary" onClick={save}>Save</button><button onClick={() => setForm(null)}>Cancel</button></div></div>
           ) : (!p.scrambled || redacted) && (
             <>
-              <div className="md" onClick={spoil} dangerouslySetInnerHTML={md((redacted ? '*This file has been redacted. Its contents are hidden and its tag no longer applies to reports.*' : p.description) || '*No description yet.*')} />
+              <Md text={(redacted ? '*This file has been redacted. Its contents are hidden and its tag no longer applies to reports.*' : p.description) || '*No description yet.*'} />
               <div className="row">
                 {!redacted && <button onClick={() => setForm(p)}>Edit file</button>}
                 <button className="primary" onClick={() => { setOpen(false); openTag([p.id]); }}>Read their reports</button>

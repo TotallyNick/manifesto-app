@@ -1,3 +1,5 @@
+'use client';
+
 /* eslint-disable react/no-unknown-property */
 import { useRef, useEffect, forwardRef } from 'react';
 import { Canvas, useFrame, useThree } from '@react-three/fiber';
@@ -209,7 +211,8 @@ function DitheredWaves({
   const prevColor = useRef([...waveColor]);
   const prevBackgroundColor = useRef([...backgroundColor]);
   useFrame(({ clock }) => {
-    const u = waveUniformsRef.current;
+    const u = mesh.current?.material?.uniforms;
+    if (!u) return;
 
     if (!disableAnimation) {
       u.time.value = clock.getElapsedTime();
@@ -272,16 +275,6 @@ function DitheredWaves({
   );
 }
 
-// WebGL contexts can be lost silently (a GPU driver reset, another tab hogging the GPU, the
-// browser reclaiming memory) — without a listener that's when this used to sit frozen on its
-// last frame instead of animating. Calling preventDefault() here is what tells the browser it's
-// safe to hand the context back once conditions clear, so it recovers instead of staying dead.
-const handleCreated = ({ gl }) => {
-  const canvas = gl.domElement;
-  canvas.addEventListener('webglcontextlost', (e) => { e.preventDefault(); console.warn('Dither: WebGL context lost, waiting to recover'); });
-  canvas.addEventListener('webglcontextrestored', () => console.info('Dither: WebGL context restored'));
-};
-
 export default function Dither({
   waveSpeed = 0.05,
   waveFrequency = 3,
@@ -299,9 +292,7 @@ export default function Dither({
       className="dither-container"
       camera={{ position: [0, 0, 6] }}
       dpr={1}
-      frameloop="always"
-      gl={{ antialias: true, powerPreference: 'low-power' }}
-      onCreated={handleCreated}
+      gl={{ antialias: true, preserveDrawingBuffer: true }}
     >
       <DitheredWaves
         waveSpeed={waveSpeed}

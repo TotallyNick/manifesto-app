@@ -1,9 +1,14 @@
-import { useEffect, useState } from 'react';
+import { lazy, Suspense, useEffect, useMemo, useState } from 'react';
 import ClickSpark from './components/ClickSpark/ClickSpark';
-import Dither from './components/Dither/Dither';
 import { THEMES, BG, hexToRgb01 } from './themes';
-import ASCIIText from './components/ASCIIText/ASCIIText';
 import BorderGlow from './components/BorderGlow/BorderGlow';
+import TextType from './components/TextType/TextType';
+// Dither (the animated background) is the only thing left in this app that pulls in three.js — plus
+// @react-three/fiber and @react-three/postprocessing on top of that — and by far the heaviest
+// dependency in the whole bundle. It's purely decorative (a shader background), so it's lazy-loaded
+// into its own chunk instead of shipping in the main bundle every visit. (ASCIIText, the other
+// three.js-based component, no longer runs on this screen — the login logo below is TextType now.)
+const Dither = lazy(() => import('./components/Dither/Dither'));
 import { api } from './api';
 import ErrorBoundary from './components/ErrorBoundary';
 import { Clock, Dashboard, Compose, Archive, Personnel, SettingsCog } from './views';
@@ -16,6 +21,20 @@ export const PUBLIC_BRAND = 'The Ledger';
 
 function Auth({ onIn }) {
   const [mode, setMode] = useState('in'), [callsign, setC] = useState(''), [passphrase, setP] = useState(''), [msg, setMsg] = useState('');
+  // A rotating splash line — two fixed messages, then a server-picked random one — cycles on the
+  // login screen the same way a game's loading-screen tips do. The random line is refetched each
+  // time the cycle laps back to the start (TextType's onCycleComplete, below), so it isn't the same
+  // one line forever; `/api/splash` is public (no `need()`) since this renders before anyone signs in.
+  const [splash, setSplash] = useState('');
+  const fetchSplash = () => { api.get('/splash').then((d) => setSplash(d.message || '')).catch(() => {}); };
+  // Wrapped in a block body (not passed directly) so the effect callback returns undefined, not the
+  // Promise chain — an effect returning anything other than a function or undefined gets treated as
+  // if it returned a cleanup ("destroy") function, and crashes when React actually tries to call it.
+  useEffect(fetchSplash, []);
+  // Memoized on `splash` alone so this array keeps the same reference across unrelated re-renders
+  // (typing a callsign, say) — TextType relies on that to avoid restarting the cycle mid-type.
+  // `.filter(Boolean)` drops the splash slot entirely until the first fetch resolves.
+  const splashLines = useMemo(() => [`Welcome to ${PUBLIC_BRAND}.`, splash, 'Speak your callsign.', splash].filter(Boolean), [splash]);
   const go = async () => {
     setMsg('');
     try {
@@ -28,9 +47,11 @@ function Auth({ onIn }) {
   };
   return (
     <main className="auth">
-      <div className="ascii-logo" aria-hidden="true"><ASCIIText text={PUBLIC_BRAND} asciiFontSize={9} textFontSize={110} planeBaseHeight={7} enableWaves={false} /></div>
+      <div className="ascii-logo" aria-hidden="true">
+        <TextType text={splashLines} typingSpeed={40} deletingSpeed={50} pauseDuration={5000}
+          cursorCharacter="_" cursorBlinkDuration={0.5} onCycleComplete={fetchSplash} />
+      </div>
       <h1 className="sr-only">{PUBLIC_BRAND}</h1>
-      <p className="dim">Speak your callsign. Ask nothing more.</p>
       <BorderGlow backgroundColor="#131315" glowColor="40 50 60" colors={['#b6913e', '#a83a32', '#4c8d82']} borderRadius={10}>
         <div className="glow-pad">
           <input placeholder="Callsign" value={callsign} onChange={(e) => setC(e.target.value)} autoComplete="username" />
@@ -39,8 +60,8 @@ function Auth({ onIn }) {
           {msg && <p className="bad">{msg}</p>}
           <button className="primary" onClick={go}>{mode === 'in' ? 'Enter' : 'Request access'}</button>
           <button onClick={() => { setMode(mode === 'in' ? 'up' : 'in'); setMsg(''); }}>
-            {mode === 'in' ? 'New here? Sign up' : 'Have a callsign? Sign in'}</button>
-          <p className="dim">The first callsign ever lodged becomes the Warden.</p>
+            {mode === 'in' ? 'Sign up' : 'Have a callsign? Sign in'}</button>
+          <p className="dim">Speak your callsign. Ask nothing more.</p>
         </div>
       </BorderGlow>
     </main>
@@ -82,11 +103,13 @@ export default function App() {
     <>
       <ErrorBoundary silent>
         <div className="bg-fixed">
-          <Dither
-            waveColor={hexToRgb01(T.spark)} backgroundColor={hexToRgb01(BG[settings.theme] || BG.nocturne)}
-            waveSpeed={0.04} waveFrequency={2.4} waveAmplitude={0.28} colorNum={4} pixelSize={2}
-            disableAnimation={settings.animate === false} enableMouseInteraction={false}
-          />
+          <Suspense fallback={null}>
+            <Dither
+              waveColor={hexToRgb01(T.spark)} backgroundColor={hexToRgb01(BG[settings.theme] || BG.nocturne)}
+              waveSpeed={0.04} waveFrequency={2.4} waveAmplitude={0.28} colorNum={4} pixelSize={2}
+              disableAnimation={settings.animate === false} enableMouseInteraction={false}
+            />
+          </Suspense>
         </div>
       </ErrorBoundary>
       <ErrorBoundary label="Manifesto">{body}</ErrorBoundary>
