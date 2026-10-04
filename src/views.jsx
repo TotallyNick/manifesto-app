@@ -653,9 +653,10 @@ function TagPicker({ tags, on, lock = [], toggle, create, close, canDelete, onDe
 export function Compose({ done, me }) {
   const [tags, setTags] = useState([]), [title, setTitle] = useState(''), [body, setBody] = useState(''), [when, setWhen] = useState(nowInput());
   const [pick, setPick] = useState([]), [conf, setConf] = useState(''), [source, setSource] = useState(''), [picker, setPicker] = useState(false), [err, setErr] = useState(''), [locked, setLocked] = useState(false);
-  // A filing defaults to the poster's own clearance — the highest level they hold. A Warden can
-  // still change it right here before lodging; this just changes what the field starts on.
-  const [clearance, setClearance] = useState(me.clearance || 0);
+  // Every filing starts at Warden-only clearance, no matter who's posting — same rule the server
+  // enforces either way (server/index.js ignores this field entirely unless you're a Warden). A
+  // Warden can still lower it right here before lodging; this just changes what the field starts on.
+  const [clearance, setClearance] = useState(MAX_CLEARANCE);
   const pending = useRef(null);
   const load = () => api.get('/tags').then((c) => setTags(c.flatMap((x) => x.tags.map((t) => ({ ...t, category: x.name })))));
   useEffect(() => { load(); }, []);
@@ -696,10 +697,8 @@ export function Compose({ done, me }) {
           </fieldset>
           {err && <p className="bad">{err}</p>}
           <p className="dim">{me.role === 'warden'
-            ? (clearance > 0 ? `Below Clearance: ${CLEARANCE_LABEL[clearance]}, this report reads as scrambled nonsense, it is encripted. A Warden can still grant it to specific people.` : 'Everyone can read this one.')
-            : (me.clearance > 0
-                ? `Filed at your own clearance, ${CLEARANCE_LABEL[me.clearance]}. Only those cleared to that level (or a Warden) can read it.`
-                : 'Everyone can read this one.')}</p>
+            ? (clearance > 0 ? `Clearance: ${CLEARANCE_LABEL[clearance]}. Below that level the report reads as scrambled nonsense — it's encrypted. A Warden can still grant it to specific people.` : 'Everyone can read this one.')
+            : `Every filing starts at ${CLEARANCE_LABEL[MAX_CLEARANCE]}. Only Wardens (and you) can read it until one lowers the clearance or grants it to someone directly.`}</p>
           <p className="dim">After you press it, the fuse burns for one second. Press Undo before it ends and nothing is sent.</p>
           <FuseButton label="Lodge report" doneLabel="Lodged" undoLabel="Undo" undoWindow={1000} size="lg" radius={10} fuse="outline"
             background="#27272a" color="#f5f5f5" fuseColor="#e0b94a" disabled={!title.trim() || !body.trim()} onCommit={arm} onUndo={undo} onFuseEnd={fire} />
@@ -1138,27 +1137,53 @@ const HB = ({ children, done, danger, onHold }) => (
 );
 
 export function Personnel({ me }) {
-  const [u, setU] = useState([]), [err, setErr] = useState('');
-  const load = () => api.get('/users').then(setU);
-  useEffect(() => { load(); }, []);
+  const [u, setU] = useState([]), [err, setErr] = useState(''), [showHidden, setShowHidden] = useState(false);
+  // Notes are edited one account at a time, inline — opening a second account's notes swaps the
+  // open one, it doesn't stack several editors at once.
+  const [notesId, setNotesId] = useState(null), [draft, setDraft] = useState('');
+  const load = () => api.get(`/users${showHidden ? '?hidden=1' : ''}`).then(setU);
+  useEffect(() => { load(); }, [showHidden]);
   const role = (id, r) => api.patch('/users/' + id, { role: r }).then(() => { setErr(''); load(); }).catch((e) => setErr(e.message));
   const clearance = (id, c) => api.patch('/users/' + id + '/clearance', { clearance: c }).then(() => { setErr(''); load(); }).catch((e) => setErr(e.message));
   const deny = (id) => api.del('/users/' + id).then(() => { setErr(''); load(); }).catch((e) => setErr(e.message));
+  // Purely a declutter tool for the Personnel list itself — doesn't touch role, clearance, or login,
+  // unlike suspending/denying above, which actually change what the account can do.
+  const setHidden = (id, hidden) => api.patch(`/users/${id}/hidden`, { hidden }).then(() => { setErr(''); load(); }).catch((e) => setErr(e.message));
+  const openNotes = (x) => { setNotesId(x.id); setDraft(x.notes || ''); };
+  const saveNotes = (id) => api.patch(`/users/${id}/notes`, { notes: draft }).then(() => { setNotesId(null); setErr(''); load(); }).catch((e) => setErr(e.message));
   return (
     <>
       <div className="panel"><h2>Personnel</h2><p className="dim">Hold a button to confirm. A tap does nothing.</p>
         {err && <p className="bad">{err}</p>}
-        <table><tbody>{u.map((x) => (
-          <tr key={x.id}><td>{x.callsign}</td><td className="dim">{x.role}</td>
-            <td>{x.id !== me.id && x.role !== 'pending' && (
-              <Sel ariaLabel={`Clearance for ${x.callsign}`} size="sm" value={x.clearance} onChange={(v) => clearance(x.id, v)}
-                options={CLEARANCE_LABEL.map((l, i) => ({ value: i, label: l }))} />)}</td>
-            <td className="dim">{stamp(x.created_at)}</td>
-            <td>{x.id !== me.id && (<div className="row">
-              {x.role === 'pending' && <><HB done="Approved" onHold={() => role(x.id, 'agent')}>Hold to approve</HB><HB danger done="Denied" onHold={() => deny(x.id)}>Hold to deny</HB></>}
-              {x.role === 'agent' && <><HB done="Promoted" onHold={() => role(x.id, 'warden')}>Hold to promote</HB><HB danger done="Suspended" onHold={() => role(x.id, 'pending')}>Hold to suspend</HB></>}
-              {x.role === 'warden' && <HB danger done="Demoted" onHold={() => role(x.id, 'agent')}>Hold to demote</HB>}
-            </div>)}</td></tr>))}</tbody></table>
+        <label className="dim"><input type="checkbox" checked={showHidden} onChange={(e) => setShowHidden(e.target.checked)} /> show hidden</label>
+        <table><tbody>{u.flatMap((x) => {
+          const row = (
+            <tr key={x.id} className={x.hidden ? 'personnel-hidden' : ''}>
+              <td>{x.callsign}{x.hidden ? ' (hidden)' : ''}</td><td className="dim">{x.role}</td>
+              <td>{x.id !== me.id && x.role !== 'pending' && (
+                <Sel ariaLabel={`Clearance for ${x.callsign}`} size="sm" value={x.clearance} onChange={(v) => clearance(x.id, v)}
+                  options={CLEARANCE_LABEL.map((l, i) => ({ value: i, label: l }))} />)}</td>
+              <td className="dim">{stamp(x.created_at)}</td>
+              <td><div className="row">
+                {x.id !== me.id && x.role === 'pending' && <><HB done="Approved" onHold={() => role(x.id, 'agent')}>Hold to approve</HB><HB danger done="Denied" onHold={() => deny(x.id)}>Hold to deny</HB></>}
+                {x.id !== me.id && x.role === 'agent' && <><HB done="Promoted" onHold={() => role(x.id, 'warden')}>Hold to promote</HB><HB danger done="Suspended" onHold={() => role(x.id, 'pending')}>Hold to suspend</HB></>}
+                {x.id !== me.id && x.role === 'warden' && <HB danger done="Demoted" onHold={() => role(x.id, 'agent')}>Hold to demote</HB>}
+                <button onClick={() => (notesId === x.id ? setNotesId(null) : openNotes(x))}>{x.notes ? 'Notes' : '+ Note'}</button>
+                <HB danger={!x.hidden} done={x.hidden ? 'Shown' : 'Hidden'} onHold={() => setHidden(x.id, !x.hidden)}>{x.hidden ? 'Hold to unhide' : 'Hold to hide'}</HB>
+              </div></td>
+            </tr>
+          );
+          if (notesId !== x.id) return [row];
+          return [row, (
+            <tr key={x.id + '-notes'}><td colSpan={5}>
+              <div className="form"><textarea rows={3} placeholder={`Notes on ${x.callsign}. Markdown works. Only Wardens ever see these.`}
+                value={draft} onChange={(e) => setDraft(e.target.value)} />
+                {err && <p className="bad">{err}</p>}
+                <div className="row"><button className="primary" onClick={() => saveNotes(x.id)}>Save</button><button onClick={() => setNotesId(null)}>Cancel</button></div>
+              </div>
+            </td></tr>
+          )];
+        })}</tbody></table>
       </div>
     </>
   );

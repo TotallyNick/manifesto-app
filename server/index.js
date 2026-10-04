@@ -187,8 +187,11 @@ app.post('/api/me/password', need(), (req, res) => {
 });
 
 /* ---------- personnel (Warden) ---------- */
-app.get('/api/users', need('warden'), (_req, res) => res.json(db.prepare(
-  'SELECT id, callsign, role, clearance, created_at FROM users WHERE removed_at IS NULL ORDER BY id').all()));
+// `hidden=1` includes accounts a Warden has pulled out of the default list (see PATCH .../hidden
+// below) — same opt-in pattern as `deleted=1` on reports/pois: hidden by default, visible on request.
+app.get('/api/users', need('warden'), (req, res) => res.json(db.prepare(
+  `SELECT id, callsign, role, clearance, notes, hidden, created_at FROM users
+   WHERE removed_at IS NULL ${req.query.hidden === '1' ? '' : 'AND hidden = 0'} ORDER BY id`).all()));
 app.patch('/api/users/:id', need('warden'), (req, res) => {
   const id = +req.params.id, role = req.body?.role;
   if (!['warden', 'agent', 'pending'].includes(role)) return res.status(400).json({ error: 'Bad role' });
@@ -201,6 +204,23 @@ app.patch('/api/users/:id/clearance', need('warden'), (req, res) => {
   const id = +req.params.id, clearance = parseClearance(req.body?.clearance);
   if (clearance === null) return res.status(400).json({ error: `Clearance must be 0-${MAX_CLEARANCE}` });
   db.prepare('UPDATE users SET clearance = ? WHERE id = ?').run(clearance, id);
+  res.json({ ok: true });
+});
+// Pulls an account out of (or back into) the default Personnel list — nothing about the account
+// itself changes, purely a declutter tool for a Warden keeping track of a lot of people. Unlike
+// suspending or denying someone, a hidden account can still log in and act exactly as before.
+app.patch('/api/users/:id/hidden', need('warden'), (req, res) => {
+  const id = +req.params.id;
+  if (!existsIn('users', id)) return res.status(404).json({ error: 'Not found' });
+  db.prepare('UPDATE users SET hidden = ? WHERE id = ?').run(req.body?.hidden ? 1 : 0, id);
+  res.json({ ok: true });
+});
+// A Warden's own freeform notes on an account — never shown to the account itself, just kept here
+// for keeping track of people, same spirit as a faction member's notes field.
+app.patch('/api/users/:id/notes', need('warden'), (req, res) => {
+  const id = +req.params.id;
+  if (!existsIn('users', id)) return res.status(404).json({ error: 'Not found' });
+  db.prepare('UPDATE users SET notes = ? WHERE id = ?').run(String(req.body?.notes || '').slice(0, 4000), id);
   res.json({ ok: true });
 });
 app.delete('/api/users/:id', need('warden'), (req, res) => { // deny an application — a Warden suspends an active account back to pending first, then denies it same as any other
@@ -421,13 +441,13 @@ app.post('/api/reports', need(), (req, res) => {
   const occ = req.body?.occurredAt ? new Date(req.body.occurredAt) : new Date(); // when it happened (retroactive filing allowed)
   if (isNaN(occ) || occ > Date.now() + 3e5) return res.status(400).json({ error: 'Invalid or future event time' });
   const manual = Array.isArray(req.body?.tagIds) ? req.body.tagIds.filter(Number.isInteger) : [];
-  // A filing defaults to the poster's own clearance level — the highest clearance they hold — so it
-  // reads as visible to themself and anyone else at or above that level, same as they already see it.
-  // A Warden can still choose a different clearance explicitly at filing time; an agent cannot.
+  // A filing always starts at the highest (Warden-only) clearance by default — same rule a POI file
+  // already followed (see savePoi below) — whoever posts it, warden included: nothing is broadly
+  // readable just because of who happened to write it. A Warden can still choose a lower clearance
+  // explicitly at filing time, or loosen it afterward via PATCH .../clearance; an agent cannot.
   const reqClearance = parseInt(req.body?.clearance, 10);
-  const clearance = req.user.role === 'warden'
-    ? Math.max(0, Math.min(MAX_CLEARANCE, Number.isInteger(reqClearance) ? reqClearance : (req.user.clearance || 0)))
-    : (req.user.clearance || 0);
+  const clearance = req.user.role === 'warden' && Number.isInteger(reqClearance)
+    ? Math.max(0, Math.min(MAX_CLEARANCE, reqClearance)) : MAX_CLEARANCE;
   const id = db.transaction(() => {
     const rid = db.prepare('INSERT INTO reports(title, body, author_id, created_at, confidence, source_id, clearance) VALUES(?,?,?,?,?,?,?)')
       .run(title, body, req.user.id, occ.toISOString(), conf(req.body.confidence), srcId(req.body.source), clearance).lastInsertRowid;
@@ -654,8 +674,13 @@ app.get('/api/reports', need(), (req, res) => {
   }
   for (const t of String(tags || '').split(',').filter(Boolean)) { w.push('r.id IN (SELECT report_id FROM report_tags WHERE tag_id = ?)'); a.push(+t); }
   const order = SORTS[sort] || SORTS['time-desc'];
-  const rows = db.prepare(`${SELECT} ${w.length ? 'WHERE ' + w.join(' AND ') : ''} ORDER BY ${order} LIMIT ? OFFSET ?`)
-    .all(...a, Math.min(+limit || 50, 200), +offset || 0);
+  // Whatever sort is picked, a report this viewer can't actually read (would come back scrambled —
+  // the exact same test hydrate() below applies) sinks beneath every report they can, so the readable
+  // ones aren't buried under a page of sealed ones. Still present, still counted — just lower.
+  const visible = `(CASE WHEN ? = 'warden' THEN 1 WHEN r.clearance <= ? THEN 1 WHEN r.author_id = ? THEN 1
+    WHEN EXISTS (SELECT 1 FROM access_grants g WHERE g.report_id = r.id AND g.user_id = ?) THEN 1 ELSE 0 END)`;
+  const rows = db.prepare(`${SELECT} ${w.length ? 'WHERE ' + w.join(' AND ') : ''} ORDER BY ${visible} DESC, ${order} LIMIT ? OFFSET ?`)
+    .all(...a, req.user.role, req.user.clearance || 0, req.user.id, req.user.id, Math.min(+limit || 50, 200), +offset || 0);
   res.json(hydrate(rows, req.user));
 });
 

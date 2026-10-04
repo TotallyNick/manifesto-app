@@ -171,6 +171,13 @@ for (const [col, ddl] of [['clearance', 'INTEGER NOT NULL DEFAULT 0'], ['cover_n
 for (const [col, ddl] of [['removed_at', 'TEXT'], ['removed_by', 'INTEGER REFERENCES users(id)']]) {
   if (!db.prepare("SELECT 1 FROM pragma_table_info('users') WHERE name = ?").get(col)) db.exec(`ALTER TABLE users ADD COLUMN ${col} ${ddl}`);
 }
+// A Warden's own bookkeeping on an account — a freeform note, and a way to pull an active account
+// out of the Personnel list without touching its role, clearance, or ability to log in. Unlike
+// removed_at above (which actually ends an account), "hidden" is purely a declutter tool, same
+// shape as notes_threads.hidden elsewhere in this file: a Warden can always toggle it back.
+for (const [col, ddl] of [['notes', "TEXT NOT NULL DEFAULT ''"], ['hidden', 'INTEGER NOT NULL DEFAULT 0']]) {
+  if (!db.prepare("SELECT 1 FROM pragma_table_info('users') WHERE name = ?").get(col)) db.exec(`ALTER TABLE users ADD COLUMN ${col} ${ddl}`);
+}
 if (!db.prepare("SELECT 1 FROM pragma_table_info('reports') WHERE name = 'clearance'").get()) {
   db.exec('ALTER TABLE reports ADD COLUMN clearance INTEGER NOT NULL DEFAULT 0');
 }
